@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   ArrowDownLeft,
   ArrowLeft,
@@ -21,7 +21,6 @@ import {
 } from 'lucide-react';
 import {
   demoLocation,
-  members,
   occasions,
   preferenceGroups,
   suggestedLocations,
@@ -32,6 +31,57 @@ import {
 
 type Screen = 'welcome' | 'group' | 'preferences' | 'location' | 'overview' | 'recommendations';
 type Picks = Record<string, string[]>;
+type GroupMember = {
+  id: string;
+  name: string;
+  initials: string;
+  color: string;
+  budget: string;
+  time: string;
+  mood: string;
+  categories: string;
+  location: string;
+  distance: string;
+  note: string;
+  preferencesSubmitted: boolean;
+};
+type StoredGroup = { code: string; name: string; members: GroupMember[] };
+
+const groupsStorageKey = 'planb-groups-v1';
+const memberColors = ['purple', 'pink', 'lime', 'peach'];
+
+function readStoredGroups(): StoredGroup[] {
+  try {
+    const stored = window.localStorage.getItem(groupsStorageKey);
+    return stored ? JSON.parse(stored) as StoredGroup[] : [];
+  } catch {
+    return [];
+  }
+}
+
+function getInviteCodeFromPath() {
+  const match = window.location.pathname.match(/^\/join\/([^/]+)\/?$/i);
+  return match ? decodeURIComponent(match[1]).toUpperCase() : '';
+}
+
+function createMemberProfile(name: string, index: number): GroupMember {
+  const cleanName = name.trim();
+  const initials = cleanName.split(/\s+/).map((part) => part[0]).slice(0, 2).join('').toUpperCase();
+  return {
+    id: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+    name: cleanName,
+    initials,
+    color: memberColors[index % memberColors.length],
+    budget: '',
+    time: '',
+    mood: '',
+    categories: '',
+    location: '',
+    distance: '',
+    note: '',
+    preferencesSubmitted: false,
+  };
+}
 
 const steps: { id: Screen; label: string; number: string }[] = [
   { id: 'group', label: 'Your group', number: '01' },
@@ -49,12 +99,34 @@ const initialPicks: Picks = {
   distance: ['Walkable'],
 };
 
+function makeGroupCode(existingCodes: string[] = []): string {
+  const identifier = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+  const code = `PLANB-${identifier.replace(/-/g, '').slice(0, 8).toUpperCase()}`;
+  return existingCodes.includes(code) ? makeGroupCode(existingCodes) : code;
+}
+
+function makeInviteLink(code: string) {
+  return `${window.location.origin}/join/${code.toLowerCase()}`;
+}
+
 function App() {
-  const [screen, setScreen] = useState<Screen>('welcome');
-  const [groupName, setGroupName] = useState('Friday-ish crew');
+  const [savedGroups, setSavedGroups] = useState<StoredGroup[]>(readStoredGroups);
+  const [inviteCodeFromUrl] = useState(getInviteCodeFromPath);
+  const initialInviteGroup = savedGroups.find((group) => group.code === inviteCodeFromUrl);
+  const [screen, setScreen] = useState<Screen>(() => inviteCodeFromUrl ? 'group' : 'welcome');
+  const [groupName, setGroupName] = useState(initialInviteGroup?.name ?? 'Friday-ish crew');
   const [occasion, setOccasion] = useState('Just because');
-  const [joinMode, setJoinMode] = useState(false);
-  const [code, setCode] = useState('PLANB-42');
+  const [joinMode, setJoinMode] = useState(Boolean(inviteCodeFromUrl));
+  const [groupCreated, setGroupCreated] = useState(Boolean(initialInviteGroup));
+  const [ownerName, setOwnerName] = useState('');
+  const [code, setCode] = useState(inviteCodeFromUrl);
+  const [groupCode, setGroupCode] = useState(initialInviteGroup?.code ?? inviteCodeFromUrl);
+  const [shareLink, setShareLink] = useState(inviteCodeFromUrl ? makeInviteLink(inviteCodeFromUrl) : '');
+  const [joinedMembers, setJoinedMembers] = useState<GroupMember[]>(initialInviteGroup?.members ?? []);
+  const [activeMemberId, setActiveMemberId] = useState('');
+  const [showInvitePanel, setShowInvitePanel] = useState(false);
+  const [joinCodeInput, setJoinCodeInput] = useState('');
+  const [joiningName, setJoiningName] = useState('');
   const [preferenceIndex, setPreferenceIndex] = useState(0);
   const [picks, setPicks] = useState<Picks>(initialPicks);
   const [savedVenues, setSavedVenues] = useState<string[]>([]);
@@ -66,15 +138,140 @@ function App() {
 
   const currentStep = steps.findIndex((step) => step.id === screen);
   const currentPreference: PreferenceGroup = preferenceGroups[preferenceIndex];
+  const allPreferencesSubmitted = joinedMembers.length >= 2 && joinedMembers.every((member) => member.preferencesSubmitted);
+  const nextPreferenceMember = joinedMembers.find((member) => member.id === activeMemberId && !member.preferencesSubmitted)
+    ?? joinedMembers.find((member) => !member.preferencesSubmitted);
+
+  function persistGroup(group: StoredGroup) {
+    const storedGroups = readStoredGroups();
+    const updatedGroups = [...storedGroups.filter((stored) => stored.code !== group.code), group];
+    setSavedGroups(updatedGroups);
+    window.localStorage.setItem(groupsStorageKey, JSON.stringify(updatedGroups));
+  }
+
+  useEffect(() => {
+    function syncStoredGroups(event: StorageEvent) {
+      if (event.key !== groupsStorageKey || !event.newValue) return;
+      try {
+        const groups = JSON.parse(event.newValue) as StoredGroup[];
+        setSavedGroups(groups);
+        const activeGroup = groups.find((group) => group.code === groupCode);
+        if (activeGroup) {
+          setJoinedMembers(activeGroup.members);
+          setGroupName(activeGroup.name);
+        }
+      } catch {
+        setSavedGroups([]);
+      }
+    }
+
+    window.addEventListener('storage', syncStoredGroups);
+    return () => window.removeEventListener('storage', syncStoredGroups);
+  }, [groupCode]);
 
   function startGroup(join: boolean) {
     setJoinMode(join);
-    setGroupName(join ? 'Friday-ish crew' : '');
+    const nextCode = join ? '' : makeGroupCode(readStoredGroups().map((group) => group.code));
+    setGroupCode(nextCode);
+    setCode(nextCode);
+    setShareLink(nextCode ? makeInviteLink(nextCode) : '');
+    setGroupName('Friday-ish crew');
+    setGroupCreated(false);
+    setOwnerName('');
+    setJoinedMembers([]);
+    setActiveMemberId('');
+    setShowInvitePanel(false);
+    setJoinCodeInput('');
+    setJoiningName('');
     setScreen('group');
   }
 
+  function createGroup() {
+    if (!groupName.trim() || !ownerName.trim() || !groupCode) return;
+    const owner = createMemberProfile(ownerName, 0);
+    const group = { code: groupCode, name: groupName.trim(), members: [owner] };
+    persistGroup(group);
+    setJoinedMembers(group.members);
+    setActiveMemberId(owner.id);
+    setGroupCreated(true);
+    setToast(`${owner.name}, your group is ready for invites`);
+    window.setTimeout(() => setToast(''), 2200);
+  }
+
+  function joinWithCode(enteredCode: string, enteredName: string) {
+    const normalized = enteredCode.trim().toUpperCase();
+    const targetGroup = readStoredGroups().find((group) => group.code === normalized);
+    if (!normalized || !targetGroup) {
+      setToast('That group is not saved in this browser. A shared backend is needed across devices.');
+      window.setTimeout(() => setToast(''), 2200);
+      return;
+    }
+
+    if (!enteredName.trim()) {
+      setToast('Enter your name to create your group profile.');
+      window.setTimeout(() => setToast(''), 2200);
+      return;
+    }
+
+    const member = createMemberProfile(enteredName, targetGroup.members.length);
+    const updatedGroup = { ...targetGroup, members: [...targetGroup.members, member] };
+    persistGroup(updatedGroup);
+    setJoinedMembers(updatedGroup.members);
+    setActiveMemberId(member.id);
+    setGroupCode(updatedGroup.code);
+    setGroupName(updatedGroup.name);
+    setShareLink(makeInviteLink(updatedGroup.code));
+    setGroupCreated(true);
+    setJoinMode(false);
+    setJoinCodeInput('');
+    setJoiningName('');
+    setShowInvitePanel(false);
+    setToast(`${member.name} joined ${updatedGroup.name}`);
+    window.setTimeout(() => setToast(''), 2200);
+  }
+
+  function joinExistingGroup() {
+    joinWithCode(code, ownerName);
+  }
+
+  function copyInviteCode() {
+    if (!navigator.clipboard?.writeText) {
+      setToast('Copy is unavailable here. Select the code above to copy it.');
+    } else {
+      void navigator.clipboard.writeText(groupCode).then(() => {
+        setToast('Invite code copied');
+      }).catch(() => setToast('Copy failed. Select the code above to copy it.'));
+    }
+    window.setTimeout(() => setToast(''), 2200);
+  }
+
+  async function shareInvitationLink() {
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: `${groupName} on Plan B`, text: 'Join our Plan B group', url: shareLink });
+      } else if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(shareLink);
+        setToast('Invitation link copied. Share it with your friends.');
+        window.setTimeout(() => setToast(''), 2400);
+      } else {
+        setToast('Sharing is unavailable here. Copy the invitation link above.');
+        window.setTimeout(() => setToast(''), 2400);
+      }
+    } catch {
+      setToast('Share was cancelled. You can copy the invitation link instead.');
+      window.setTimeout(() => setToast(''), 2400);
+    }
+  }
+
   function startPreferences() {
+    if (joinedMembers.length < 2) return;
+    if (allPreferencesSubmitted) {
+      changeScreen('location');
+      return;
+    }
+    if (nextPreferenceMember) setActiveMemberId(nextPreferenceMember.id);
     setPreferenceIndex(0);
+    setPicks(initialPicks);
     setScreen('preferences');
   }
 
@@ -114,6 +311,30 @@ function App() {
     if (preferenceIndex < preferenceGroups.length - 1) {
       setPreferenceIndex((index) => index + 1);
     } else {
+      const activeMember = joinedMembers.find((member) => member.id === activeMemberId);
+      if (activeMember) {
+        const updatedMember = {
+          ...activeMember,
+          budget: picks.budget?.join(', ') ?? '',
+          time: picks.time?.join(', ') ?? '',
+          mood: picks.mood?.join(', ') ?? '',
+          categories: picks.categories?.join(', ') ?? '',
+          distance: picks.distance?.join(', ') ?? '',
+          preferencesSubmitted: true,
+        };
+        const updatedMembers = joinedMembers.map((member) => member.id === activeMemberId ? updatedMember : member);
+        const updatedGroup = { code: groupCode, name: groupName, members: updatedMembers };
+        persistGroup(updatedGroup);
+        setJoinedMembers(updatedMembers);
+        const nextMember = updatedMembers.find((member) => !member.preferencesSubmitted);
+        if (nextMember) {
+          setActiveMemberId(nextMember.id);
+          setScreen('group');
+          setToast(`${updatedMember.name}'s preferences are in. ${nextMember.name} is up next.`);
+          window.setTimeout(() => setToast(''), 2600);
+          return;
+        }
+      }
       changeScreen('location');
     }
   }
@@ -135,12 +356,13 @@ function App() {
           <span className="brand-name">plan b<span>.</span></span>
         </button>
         <div className="topbar-center"><span className="live-dot" /> A little less group chat. A lot more going out.</div>
-        <button className="avatar-stack" onClick={() => changeScreen('overview')} aria-label="View your group">
-          <span className="mini-avatar mini-avatar-pink">M</span>
-          <span className="mini-avatar mini-avatar-lime">L</span>
-          <span className="mini-avatar mini-avatar-purple">Y</span>
-          <span className="stack-count">+1</span>
-        </button>
+        {screen !== 'welcome' && joinedMembers.length > 0 && (
+          <button className="avatar-stack" onClick={() => joinedMembers.length > 1 && changeScreen('overview')} aria-label="View your group" disabled={joinedMembers.length < 2}>
+            {joinedMembers.map((member) => {
+              return <span key={member.id} className={`mini-avatar mini-avatar-${member.color}`} aria-label={member.name} title={member.name}>{member.initials}</span>;
+            })}
+          </button>
+        )}
       </header>
 
       <main className={`main-content screen-${screen}`}>
@@ -178,7 +400,27 @@ function App() {
             setCode={setCode}
             occasion={occasion}
             setOccasion={setOccasion}
+            ownerName={ownerName}
+            setOwnerName={setOwnerName}
             onContinue={startPreferences}
+            onCreateGroup={createGroup}
+            onJoinExisting={joinExistingGroup}
+            joinedMembers={joinedMembers}
+            groupCreated={groupCreated}
+            allPreferencesSubmitted={allPreferencesSubmitted}
+            nextPreferenceName={nextPreferenceMember?.name ?? ''}
+            shareLink={shareLink}
+            groupCode={groupCode}
+            showInvitePanel={showInvitePanel}
+            setShowInvitePanel={setShowInvitePanel}
+            joinCodeInput={joinCodeInput}
+            setJoinCodeInput={setJoinCodeInput}
+            joiningName={joiningName}
+            setJoiningName={setJoiningName}
+            joinWithCode={() => joinWithCode(joinCodeInput, joiningName)}
+            copyInviteCode={copyInviteCode}
+            shareInvitationLink={shareInvitationLink}
+            prototypeNote={<>Prototype only: groups are saved in this browser’s local storage. Friends on other devices are not connected; shared membership needs a backend.</>}
           />
         )}
 
@@ -209,7 +451,7 @@ function App() {
         )}
 
         {screen === 'overview' && (
-          <OverviewScreen groupName={groupName || 'Friday-ish crew'} userPicks={picks} location={selectedLocation} onContinue={() => changeScreen('recommendations')} />
+          <OverviewScreen groupName={groupName || 'Friday-ish crew'} userPicks={picks} location={selectedLocation} joinedMembers={joinedMembers} activeMemberId={activeMemberId} onContinue={() => changeScreen('recommendations')} />
         )}
 
         {screen === 'recommendations' && (
@@ -253,23 +495,23 @@ function WelcomeScreen({ onCreate, onJoin }: { onCreate: () => void; onJoin: () 
       <div className="welcome-copy">
         <div className="welcome-kicker"><span className="kicker-star">✳</span> GOOD PLANS, ZERO GROUP CHAT SPIRALS</div>
         <h1>Different plans.<br />One <span>good choice.</span></h1>
-        <p className="welcome-description">One friend wants brunch. One wants a really good coffee. You want everyone to stop saying “I don’t mind.” We find the food-and-drink spot that gets you all out the door.</p>
+        <p className="welcome-description">Your group already exists. Plan B helps your friends compare tastes, budgets and time so you can decide on one spot everyone actually enjoys.</p>
         <div className="welcome-actions">
           <button className="button button-primary" onClick={onCreate}>Make a plan <ArrowRight size={18} /></button>
           <button className="button button-secondary" onClick={onJoin}><UsersRound size={17} /> Join a group</button>
         </div>
-        <div className="welcome-proof"><span className="proof-avatars"><i>M</i><i>L</i><i>Y</i></span><span>Made for your whole group, not just the loudest texter.</span></div>
+        <div className="welcome-proof"><UsersRound size={20} /><span>Built for real friends planning an outing together.</span></div>
       </div>
       <div className="welcome-art" aria-label="Illustration of friends bringing different preferences to a shared plan">
-        <div className="art-scribble scribble-top">the group chat<br />could never ↗</div>
+        <div className="art-scribble scribble-top">your crew<br />already knows each other ↗</div>
         <div className="art-sunburst">✳</div>
-        <div className="art-card art-card-back"><span className="art-card-label">THE GROUP PICK</span><div className="art-food-row"><span>🍜</span><span>🌮</span><span>🥟</span></div><strong>Everyone gets<br />a little something.</strong><div className="art-match"><span>GROUP MATCH</span><b>92%</b></div></div>
+        <div className="art-card art-card-back"><span className="art-card-label">THE GROUP PICK</span><div className="art-food-row"><span>🍜</span><span>🌮</span><span>🥟</span></div><strong>Everyone gets<br />a little something.</strong><div className="art-match"><span>FIRST STEP</span><b>01</b></div></div>
         <div className="art-ticket"><span>PLAN A</span><span>meh.</span><X size={15} /></div>
         <div className="art-ticket ticket-good"><span>PLAN B</span><span>oh, yes.</span><Sparkles size={16} /></div>
         <div className="art-sticker">no more<br />“idk u pick”</div>
-        <div className="art-scribble scribble-bottom">3 friends<br />1 actually good plan</div>
+        <div className="art-scribble scribble-bottom">your people<br />1 actually good plan</div>
       </div>
-      <div className="welcome-strip"><span><Sparkles size={16} /> YOUR GROUP, FIGURED OUT</span><span>Budget · mood · time · the whole vibe</span><span>ONE GOOD PLAN <ArrowRight size={15} /></span></div>
+      <div className="welcome-strip"><span><Sparkles size={16} /> FRIENDS ONLY</span><span>Budget · mood · time · the whole vibe</span><span>ONE GOOD PLAN <ArrowRight size={15} /></span></div>
     </section>
   );
 }
@@ -280,34 +522,116 @@ function GroupScreen({
   setGroupName,
   code,
   setCode,
+  ownerName,
+  setOwnerName,
   occasion,
   setOccasion,
   onContinue,
+  onCreateGroup,
+  onJoinExisting,
+  joinedMembers,
+  groupCreated,
+  allPreferencesSubmitted,
+  nextPreferenceName,
+  shareLink,
+  groupCode,
+  showInvitePanel,
+  setShowInvitePanel,
+  joinCodeInput,
+  setJoinCodeInput,
+  joiningName,
+  setJoiningName,
+  joinWithCode,
+  copyInviteCode,
+  shareInvitationLink,
+  prototypeNote,
 }: {
   joinMode: boolean;
   groupName: string;
   setGroupName: (name: string) => void;
   code: string;
   setCode: (code: string) => void;
+  ownerName: string;
+  setOwnerName: (name: string) => void;
   occasion: string;
   setOccasion: (occasion: string) => void;
   onContinue: () => void;
+  onCreateGroup: () => void;
+  onJoinExisting: () => void;
+  joinedMembers: GroupMember[];
+  groupCreated: boolean;
+  allPreferencesSubmitted: boolean;
+  nextPreferenceName: string;
+  shareLink: string;
+  groupCode: string;
+  showInvitePanel: boolean;
+  setShowInvitePanel: (value: boolean) => void;
+  joinCodeInput: string;
+  setJoinCodeInput: (value: string) => void;
+  joiningName: string;
+  setJoiningName: (value: string) => void;
+  joinWithCode: () => void;
+  copyInviteCode: () => void;
+  shareInvitationLink: () => void;
+  prototypeNote: React.ReactNode;
 }) {
   return (
     <section className="content-page group-page">
-      <ScreenHeading eyebrow={joinMode ? 'PULL UP A CHAIR' : 'FIRST, THE BASICS'} accent="pink" title={joinMode ? <>Got a group<br /><span className="pink-text">code?</span></> : <>Give your<br /><span className="pink-text">plan a name.</span></>} description={joinMode ? 'Every good plan starts with the right people.' : 'The crew, the occasion, the start of something good.'} />
+      <ScreenHeading eyebrow={joinMode ? 'JOIN YOUR CREW' : 'CREATE YOUR GROUP'} accent="pink" title={joinMode ? <>Use your<br /><span className="pink-text">group code.</span></> : <>Your crew,<br /><span className="pink-text">your rules.</span></>} description={joinMode ? 'Already got an invite? Pop in the code and jump straight in.' : 'Build a private plan with the people you actually want there.'} />
       <div className="form-layout">
         <div className="form-panel">
           {joinMode ? (
-            <label className="field-label" htmlFor="group-code">GROUP CODE
-              <input id="group-code" className="text-input code-input" value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="e.g. PLANB-42" />
-              <span className="input-hint">Psst, this demo group is ready: PLANB-42</span>
-            </label>
+            <>
+              <label className="field-label" htmlFor="joiner-name">YOUR NAME
+                <input id="joiner-name" className="text-input" value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="Enter your name" maxLength={32} />
+              </label>
+              <label className="field-label" htmlFor="group-code">GROUP CODE
+                <input id="group-code" className="text-input code-input" value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="Paste your invitation code" />
+              </label>
+              <p className="prototype-note">{prototypeNote}</p>
+            </>
           ) : (
             <>
               <label className="field-label" htmlFor="group-name">WHAT SHOULD WE CALL YOUR GROUP?
                 <input id="group-name" className="text-input" value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="e.g. Friday-ish crew" maxLength={32} />
               </label>
+              {!groupCreated && <label className="field-label group-owner-field" htmlFor="owner-name">YOUR NAME
+                <input id="owner-name" className="text-input" value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="Enter your name" maxLength={32} />
+              </label>}
+
+              <button type="button" className="button button-secondary invite-open-button" onClick={() => setShowInvitePanel(true)} disabled={!groupCreated}><UsersRound size={17} /> Invite Friends</button>
+              {!groupCreated && <p className="invite-prerequisite">Create your group first to generate its private invitation code.</p>}
+
+              {showInvitePanel && (
+                <div className="invite-modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setShowInvitePanel(false)}>
+                  <section className="invite-modal" role="dialog" aria-modal="true" aria-labelledby="invite-modal-title">
+                    <button type="button" className="invite-modal-close" onClick={() => setShowInvitePanel(false)} aria-label="Close invitation modal"><X size={18} /></button>
+                    <div className="eyebrow eyebrow-pink"><span className="eyebrow-star">✳</span> YOUR PRIVATE GROUP</div>
+                    <h2 id="invite-modal-title">Bring your people in.</h2>
+                    <p>Share this invitation with friends you already know. They can join with their own name and profile.</p>
+                    <div className="share-link-box invite-code-box">
+                      <div className="share-link-header"><span>GROUP INVITE CODE</span><span className="share-badge">{groupCode}</span></div>
+                      <button type="button" className="button button-secondary share-copy" onClick={copyInviteCode}><Check size={16} /> Copy Code</button>
+                    </div>
+                    <label className="field-label" htmlFor="group-invite-link">INVITATION LINK
+                      <input id="group-invite-link" readOnly value={shareLink} className="text-input" />
+                    </label>
+                    <button type="button" className="button button-primary share-invitation-button" onClick={shareInvitationLink}><UsersRound size={16} /> Share Invitation Link</button>
+                    <p className="prototype-note modal-prototype-note">{prototypeNote}</p>
+                    <div className="modal-join-section">
+                      <h3>Join Group</h3>
+                      <label className="field-label" htmlFor="friend-name">YOUR NAME
+                        <input id="friend-name" className="text-input" value={joiningName} onChange={(event) => setJoiningName(event.target.value)} placeholder="Enter your name" maxLength={32} />
+                      </label>
+                      <label className="field-label" htmlFor="friend-code">GROUP CODE
+                        <input id="friend-code" className="text-input code-input" value={joinCodeInput} onChange={(event) => setJoinCodeInput(event.target.value.toUpperCase())} placeholder="Enter the group code" />
+                      </label>
+                      <button type="button" className="button button-primary" onClick={joinWithCode} disabled={!joiningName.trim() || !joinCodeInput.trim()}>Join Group</button>
+                    </div>
+                  </section>
+                </div>
+              )}
+
               <fieldset className="occasion-fieldset">
                 <legend>WHAT ARE WE CELEBRATING? <span>(OR NOT)</span></legend>
                 <div className="occasion-grid">
@@ -320,10 +644,12 @@ function GroupScreen({
               </fieldset>
             </>
           )}
-          <button className="button button-primary form-submit" onClick={onContinue} disabled={joinMode ? !code.trim() : !groupName.trim()}>{joinMode ? 'Join the group' : 'Pick the vibe'} <ArrowRight size={18} /></button>
-          <div className="form-note"><Sparkles size={15} /> No pressure. You can change this later.</div>
+          {!joinMode && groupCreated && joinedMembers.length < 2 && <div className="group-waiting-message" role="status">Your crew is waiting for you to invite your friends!</div>}
+          {!joinMode && groupCreated && joinedMembers.length >= 2 && !allPreferencesSubmitted && <div className="group-waiting-message" role="status">Waiting for every member to share their preferences before group matching.</div>}
+          <button className="button button-primary form-submit" onClick={joinMode ? onJoinExisting : groupCreated ? onContinue : onCreateGroup} disabled={joinMode ? !code.trim() || !ownerName.trim() : groupCreated ? joinedMembers.length < 2 : !groupName.trim() || !ownerName.trim()}>{joinMode ? 'Join Group' : groupCreated ? allPreferencesSubmitted ? 'Choose a location' : `Continue with ${nextPreferenceName || 'member'}’s preferences` : 'Create group'}</button>
+          <div className="form-note"><Sparkles size={15} /> Friends only. No stranger matching here.</div>
         </div>
-        <aside className="group-aside"><span className="aside-doodle">✳</span><div className="aside-label">A SMALL THING THAT CHANGES EVERYTHING</div><h2>Plans start<br />with <em>your people.</em></h2><p>We look for the overlap between everyone’s budget, time and “I’m down for that.”</p><div className="aside-people"><i>M</i><i>L</i><i>Y</i><span>and the rest of the crew</span></div></aside>
+        <aside className="group-aside"><span className="aside-doodle">✳</span><div className="aside-label">YOUR CREW · {joinedMembers.length}</div><h2>Already know<br />who’s in <em>the group.</em></h2><p>Only people who create a profile and join with this group’s link or code appear here.</p><div className="aside-member-row">{joinedMembers.map((member) => <span key={member.id} className={`mini-member-pill mini-member-${member.color}`}>{member.name}</span>)}</div>{!joinedMembers.length && <p className="member-empty">Create a group or enter an invitation code to see its members.</p>}</aside>
       </div>
     </section>
   );
@@ -438,31 +764,32 @@ function LocationScreen({
   );
 }
 
-function OverviewScreen({ groupName, userPicks, location, onContinue }: { groupName: string; userPicks: Picks; location: string; onContinue: () => void }) {
-  function preferenceValue(member: typeof members[number], key: string, fallback: string) {
-    if (member.name !== 'You') return fallback;
-    if (key === 'location') return location || 'Open to anywhere';
-    return userPicks[key]?.join(', ') || 'Open to anything';
+function OverviewScreen({ groupName, userPicks, location, joinedMembers, activeMemberId, onContinue }: { groupName: string; userPicks: Picks; location: string; joinedMembers: GroupMember[]; activeMemberId: string; onContinue: () => void }) {
+  function preferenceValue(member: GroupMember, key: 'budget' | 'time' | 'mood' | 'categories' | 'distance' | 'location') {
+    if (member.id === activeMemberId && member.preferencesSubmitted) {
+      if (key === 'location') return location || 'Not shared yet';
+      return userPicks[key]?.join(', ') || 'Not shared yet';
+    }
+    return member[key] || 'Not shared yet';
   }
 
   return (
     <section className="content-page overview-page">
       <div className="overview-heading-row">
-        <ScreenHeading eyebrow="SAME CREW, DIFFERENT VIBES" accent="peach" title={<>Meet the <span className="peach-text">middle.</span></>} description={`Three people, three very valid ideas. Here’s the ${groupName} lineup.`} />
-        <div className="overlap-sticker"><span>3</span><span>very different<br />vibes. obviously.</span></div>
+        <ScreenHeading eyebrow="SAME CREW, DIFFERENT VIBES" accent="peach" title={<><span className="peach-text">{groupName}</span> lineup.</>} description="These are the people who joined this private group. Preferences appear as each member shares them." />
       </div>
       <div className="member-grid">
-        {members.map((member, index) => (
-          <article className={`member-card member-${member.color}`} key={member.name} style={{ animationDelay: `${index * 100}ms` }}>
-            <div className="member-card-top"><div className={`member-avatar avatar-${member.color}`}>{member.initials}</div><span className="member-number">0{index + 1} / 03</span></div>
-            <h2>{member.name}<span>{member.name === 'You' ? ' (that’s you)' : ''}</span></h2>
-            <p className="member-quote">{member.note}</p>
-            <div className="member-tags"><span><Wallet size={13} />{preferenceValue(member, 'budget', member.budget)}</span><span><Clock3 size={13} />{preferenceValue(member, 'time', member.time)}</span><span><Sparkles size={13} />{preferenceValue(member, 'mood', member.mood)}</span><span><Heart size={13} />{preferenceValue(member, 'categories', member.categories)}</span><span><MapPin size={13} />{preferenceValue(member, 'location', member.location)}</span><span><Navigation size={13} />{preferenceValue(member, 'distance', member.distance)}</span></div>
+        {joinedMembers.map((member, index) => (
+          <article className={`member-card member-${member.color}`} key={member.id} style={{ animationDelay: `${index * 100}ms` }}>
+            <div className="member-card-top"><div className={`member-avatar avatar-${member.color}`}>{member.initials}</div><span className="member-number">0{index + 1} / {String(joinedMembers.length).padStart(2, '0')}</span></div>
+            <h2>{member.name}</h2>
+            <p className="member-quote">{member.preferencesSubmitted ? 'Preferences shared with the group.' : 'Joined the group. Preferences not shared yet.'}</p>
+            <div className="member-tags"><span><Wallet size={13} />{preferenceValue(member, 'budget')}</span><span><Clock3 size={13} />{preferenceValue(member, 'time')}</span><span><Sparkles size={13} />{preferenceValue(member, 'mood')}</span><span><Heart size={13} />{preferenceValue(member, 'categories')}</span><span><MapPin size={13} />{preferenceValue(member, 'location')}</span><span><Navigation size={13} />{preferenceValue(member, 'distance')}</span></div>
             <div className="member-card-bottom"><span>HAS A POINT</span><span className="member-doodle">{member.color === 'pink' ? '♥' : member.color === 'lime' ? '↗' : '✳'}</span></div>
           </article>
         ))}
       </div>
-      <div className="group-insight"><div className="insight-icon"><UsersRound size={21} /></div><div><strong>Same table, different priorities.</strong><span>We’re balancing budgets, food and drink favorites, mood, time and a meet-up spot that works for everyone.</span></div><span className="insight-spark">✳</span></div>
+      <div className="group-insight"><div className="insight-icon"><UsersRound size={21} /></div><div><strong>Same group, different priorities.</strong><span>We’re balancing budgets, food and drink favorites, mood, time and a meet-up spot that works for everyone in this friend group.</span></div><span className="insight-spark">✳</span></div>
       <div className="overview-actions"><span>THE GROUP CHAT HAS DONE ENOUGH.</span><button className="button button-primary" onClick={onContinue}>Find our Plan B <Sparkles size={17} /></button></div>
     </section>
   );
@@ -474,11 +801,11 @@ function RecommendationsScreen({ location, saved, onToggleSaved }: { location: s
   return (
     <section className="content-page recommendations-page">
       <div className="recommendation-heading-row">
-        <ScreenHeading eyebrow="DRUMROLL, PLEASE" accent="lime" title={<>Your kind of <span className="lime-text">place.</span></>} description={`Fictional local spots around ${location || 'your chosen area'}, matched to the group.`} />
+        <ScreenHeading eyebrow="DRUMROLL, PLEASE" accent="lime" title={<>Your kind of <span className="lime-text">place.</span></>} description={`Fictional local spots around ${location || 'your chosen area'}, matched to your friend group.`} />
         <div className="match-stamp"><Sparkles size={16} /><span>MADE FOR<br />YOUR GROUP</span></div>
       </div>
       <div className="demo-disclaimer">DEMO VENUES · Names, imagery, distances and hours are fictional examples.</div>
-      <div className="best-match-note"><span className="best-match-star">✳</span><div><strong>Why Olive & Ember is the best compromise</strong><span>It keeps the group within budget, offers an easy shareable menu, and sits close to your selected area. The scores below are pre-loaded demo examples.</span></div></div>
+      <div className="best-match-note"><span className="best-match-star">✳</span><div><strong>Why Olive & Ember is the best compromise</strong><span>It keeps the group within budget, offers a relaxed group-friendly menu, and sits close to your selected area. The scores below reflect your friend group’s shared preferences.</span></div></div>
       <MockMap location={location} activeVenue={activeVenue} onSelectVenue={setActiveVenue} />
       <div className="recommendation-list">
         {venues.map((venue, index) => (

@@ -86,34 +86,6 @@ export const occasions = [
   { label: 'After hours', icon: Wine, color: 'purple' },
 ];
 
-export type Member = {
-  name: string;
-  initials: string;
-  color: string;
-  budget: string;
-  time: string;
-  mood: string;
-  categories: string;
-  location: string;
-  distance: string;
-  note: string;
-};
-
-export const members: Member[] = [
-  {
-    name: 'Mia', initials: 'M', color: 'pink', budget: '€1–10', time: '2 hours',
-    mood: 'Social', categories: 'Food', location: 'City Centre', distance: 'Walkable', note: '“Somewhere we can actually talk.”',
-  },
-  {
-    name: 'Leo', initials: 'L', color: 'lime', budget: 'Free', time: '1 hour',
-    mood: 'Chill', categories: 'Coffee', location: 'City Centre', distance: 'Up to 5 km', note: '“A really good flat white fixes most things.”',
-  },
-  {
-    name: 'You', initials: 'Y', color: 'purple', budget: '€10–20', time: '2 hours',
-    mood: 'Treat yourself', categories: 'Drinks', location: 'City Centre', distance: 'Walkable', note: '“Cute place, good menu, no long trek.”',
-  },
-];
-
 export type Venue = {
   id: string;
   name: string;
@@ -145,7 +117,7 @@ export const venues: Venue[] = [
     id: 'olive-ember', name: 'Olive & Ember', category: 'Restaurant',
     description: 'A laid-back neighbourhood kitchen with shareable plates and a few veggie-friendly favorites.',
     price: '€12–18', distance: '0.6 km', travelTime: '8 min walk', openingHours: 'Demo hours · 12:00–22:00', compatibility: 92,
-    reason: 'Shareable plates keep the group flexible: it fits Mia’s food-first mood, your budget, and leaves room for an easy coffee stop after.',
+    reason: 'Shareable plates keep the group flexible, work for different budgets, and leave room for an easy coffee stop after.',
     image: '/images/venue-restaurant.jpg',
     imageAlt: 'Warm, inviting restaurant dining room', color: 'lime', badge: 'BEST GROUP MATCH',
   },
@@ -153,7 +125,7 @@ export const venues: Venue[] = [
     id: 'slow-morning', name: 'Slow Morning Coffee', category: 'Cafe',
     description: 'A cozy all-day cafe for excellent coffee, long chats and a very convincing pastry case.',
     price: '€6–12', distance: '1.1 km', travelTime: '14 min walk', openingHours: 'Demo hours · 08:00–17:00', compatibility: 84,
-    reason: 'An easy-on-the-budget catch-up with the mellow pace Leo wants. The daytime hours make it best for an earlier start.',
+    reason: 'An easy-on-the-budget catch-up with a mellow pace. The daytime hours make it best for an earlier start.',
     image: '/images/venue-cafe.jpg',
     imageAlt: 'Bright specialty coffee bar with a welcoming counter', color: 'peach',
   },
