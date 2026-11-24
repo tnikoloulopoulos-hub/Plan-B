@@ -23,6 +23,15 @@ export type PreferenceGroup = {
   choices: Choice[];
 };
 
+export type PlaceCategory = 'cafe' | 'restaurant' | 'bar' | 'activity';
+
+export const placeCategories: { id: PlaceCategory; label: string }[] = [
+  { id: 'cafe', label: 'Cafes' },
+  { id: 'restaurant', label: 'Restaurants' },
+  { id: 'bar', label: 'Bars & pubs' },
+  { id: 'activity', label: 'Activities' },
+];
+
 export const preferenceGroups: PreferenceGroup[] = [
   {
     key: 'budget',
@@ -65,6 +74,8 @@ export const preferenceGroups: PreferenceGroup[] = [
       { label: 'Food', icon: Utensils, color: 'peach' },
       { label: 'Coffee', icon: Coffee, color: 'lime' },
       { label: 'Drinks', icon: Wine, color: 'pink' },
+      { label: 'Outdoors', icon: MapPin, color: 'purple' },
+      { label: 'Entertainment', icon: Music2, color: 'peach' },
     ],
   },
   {
@@ -84,57 +95,4 @@ export const occasions = [
   { label: 'Birthday', icon: Music2, color: 'pink' },
   { label: 'Coffee catch-up', icon: Coffee, color: 'peach' },
   { label: 'After hours', icon: Wine, color: 'purple' },
-];
-
-export type Venue = {
-  id: string;
-  name: string;
-  category: 'Restaurant' | 'Cafe' | 'Bar';
-  description: string;
-  price: string;
-  distance: string;
-  travelTime: string;
-  openingHours: string;
-  compatibility: number;
-  reason: string;
-  image: string;
-  imageAlt: string;
-  color: string;
-  badge?: string;
-};
-
-export const demoLocation = 'Dublin City Centre';
-
-export const suggestedLocations = [
-  'Dublin City Centre',
-  'Ranelagh',
-  'Smithfield',
-  'Portobello',
-];
-
-export const venues: Venue[] = [
-  {
-    id: 'olive-ember', name: 'Olive & Ember', category: 'Restaurant',
-    description: 'A laid-back neighbourhood kitchen with shareable plates and a few veggie-friendly favorites.',
-    price: '€12–18', distance: '0.6 km', travelTime: '8 min walk', openingHours: 'Demo hours · 12:00–22:00', compatibility: 92,
-    reason: 'Shareable plates keep the group flexible, work for different budgets, and leave room for an easy coffee stop after.',
-    image: '/images/venue-restaurant.jpg',
-    imageAlt: 'Warm, inviting restaurant dining room', color: 'lime', badge: 'BEST GROUP MATCH',
-  },
-  {
-    id: 'slow-morning', name: 'Slow Morning Coffee', category: 'Cafe',
-    description: 'A cozy all-day cafe for excellent coffee, long chats and a very convincing pastry case.',
-    price: '€6–12', distance: '1.1 km', travelTime: '14 min walk', openingHours: 'Demo hours · 08:00–17:00', compatibility: 84,
-    reason: 'An easy-on-the-budget catch-up with a mellow pace. The daytime hours make it best for an earlier start.',
-    image: '/images/venue-cafe.jpg',
-    imageAlt: 'Bright specialty coffee bar with a welcoming counter', color: 'peach',
-  },
-  {
-    id: 'lilac-hour', name: 'The Lilac Hour', category: 'Bar',
-    description: 'A low-key little cocktail spot with zero-proof options and a playlist worth Shazaming.',
-    price: '€14–20', distance: '1.8 km', travelTime: '9 min by transit', openingHours: 'Demo hours · 16:00–00:00', compatibility: 76,
-    reason: 'Best for your treat-yourself mood and a social night out. It lands near the top of the budget, so it’s the fun stretch pick.',
-    image: '/images/venue-bar.jpg',
-    imageAlt: 'Colorful cocktails on a softly lit bar counter', color: 'purple',
-  },
 ];

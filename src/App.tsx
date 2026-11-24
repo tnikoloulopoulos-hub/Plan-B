@@ -1,5 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import L from 'leaflet';
+import { MapContainer, Marker, Popup, TileLayer, useMap } from 'react-leaflet';
 import {
+  Activity,
   ArrowDownLeft,
   ArrowLeft,
   ArrowRight,
@@ -9,62 +12,111 @@ import {
   Clock3,
   Coffee,
   Heart,
+  LoaderCircle,
   MapPin,
   Navigation,
   Plus,
   Search,
   Sparkles,
+  Utensils,
   UsersRound,
   Wallet,
   Wine,
-  X,
 } from 'lucide-react';
 import {
-  demoLocation,
-  occasions,
+  placeCategories,
   preferenceGroups,
-  suggestedLocations,
-  venues,
-  type Venue,
   type PreferenceGroup,
+  type PlaceCategory,
 } from './data';
+import {
+  fetchNearbyPlaces,
+  rankPlaces,
+  reverseGeocodeLocation,
+  searchLocations,
+  type LocationSearchResult,
+  type LocationSelection,
+  type OpenStreetMapPlace,
+} from './openStreetMap';
 
-type Screen = 'welcome' | 'group' | 'preferences' | 'location' | 'overview' | 'recommendations';
-type Picks = Record<string, string[]>;
+type Screen = 'welcome' | 'group' | 'turn' | 'preferences' | 'location' | 'overview' | 'recommendations';
+type PreferenceKey = PreferenceGroup['key'];
+type Picks = Record<PreferenceKey, string[]>;
 type GroupMember = {
   id: string;
   name: string;
   initials: string;
   color: string;
-  budget: string;
-  time: string;
-  mood: string;
-  categories: string;
-  location: string;
-  distance: string;
-  note: string;
+  picks: Picks;
   preferencesSubmitted: boolean;
 };
-type StoredGroup = { code: string; name: string; members: GroupMember[] };
+type GroupSession = {
+  name: string;
+  participantCount: number;
+  occasion: string;
+  selectedLocation: LocationSelection | null;
+  members: GroupMember[];
+};
 
-const groupsStorageKey = 'planb-groups-v1';
+const sessionStorageKey = 'planb-session-v2';
 const memberColors = ['purple', 'pink', 'lime', 'peach'];
+const emptyPicks: Picks = { budget: [], time: [], mood: [], categories: [], distance: [] };
+const placeMarkerIcon = L.divIcon({
+  className: 'place-map-marker',
+  html: '<span></span>',
+  iconSize: [24, 24],
+  iconAnchor: [12, 12],
+});
+const steps: { id: Screen; label: string; number: string }[] = [
+  { id: 'group', label: 'Your group', number: '01' },
+  { id: 'preferences', label: 'The vibe', number: '02' },
+  { id: 'location', label: 'Location', number: '03' },
+  { id: 'overview', label: 'Review', number: '04' },
+  { id: 'recommendations', label: 'The plan', number: '05' },
+];
 
-function readStoredGroups(): StoredGroup[] {
+function readSavedSession(): GroupSession | null {
   try {
-    const stored = window.localStorage.getItem(groupsStorageKey);
-    return stored ? JSON.parse(stored) as StoredGroup[] : [];
-  } catch {
-    return [];
+    const stored = window.localStorage.getItem(sessionStorageKey);
+    if (!stored) return null;
+    const parsed: unknown = JSON.parse(stored);
+    if (
+      typeof parsed === 'object' && parsed !== null &&
+      'name' in parsed && typeof parsed.name === 'string' &&
+      'participantCount' in parsed && typeof parsed.participantCount === 'number' &&
+      'members' in parsed && Array.isArray(parsed.members)
+    ) {
+      const session = parsed as Omit<GroupSession, 'selectedLocation'> & { selectedLocation: unknown };
+      const location = session.selectedLocation;
+      if (location === null || location === '') return { ...session, selectedLocation: null };
+      if (
+        typeof location !== 'object' || location === null ||
+        !('name' in location) || typeof location.name !== 'string' ||
+        !('lat' in location) || typeof location.lat !== 'number' ||
+        !('lon' in location) || typeof location.lon !== 'number' ||
+        !('source' in location) || (location.source !== 'current' && location.source !== 'manual')
+      ) {
+        return { ...session, selectedLocation: null };
+      }
+      return { ...session, selectedLocation: location as LocationSelection };
+    }
+    console.error('Saved Plan B session has an unexpected format.');
+    return null;
+  } catch (error) {
+    console.error('Could not read the saved Plan B session.', error);
+    return null;
   }
 }
 
-function getInviteCodeFromPath() {
-  const match = window.location.pathname.match(/^\/join\/([^/]+)\/?$/i);
-  return match ? decodeURIComponent(match[1]).toUpperCase() : '';
+function getInitialScreen(session: GroupSession | null): Screen {
+  if (!session) return 'welcome';
+  if (session.members.some((member) => !member.preferencesSubmitted)) return 'preferences';
+  if (session.members.length >= session.participantCount) return session.selectedLocation ? 'overview' : 'location';
+  if (session.members.length) return 'turn';
+  return 'group';
 }
 
-function createMemberProfile(name: string, index: number): GroupMember {
+function createMember(name: string, index: number): GroupMember {
   const cleanName = name.trim();
   const initials = cleanName.split(/\s+/).map((part) => part[0]).slice(0, 2).join('').toUpperCase();
   return {
@@ -72,237 +124,127 @@ function createMemberProfile(name: string, index: number): GroupMember {
     name: cleanName,
     initials,
     color: memberColors[index % memberColors.length],
-    budget: '',
-    time: '',
-    mood: '',
-    categories: '',
-    location: '',
-    distance: '',
-    note: '',
+    picks: { ...emptyPicks },
     preferencesSubmitted: false,
   };
 }
 
-const steps: { id: Screen; label: string; number: string }[] = [
-  { id: 'group', label: 'Your group', number: '01' },
-  { id: 'preferences', label: 'The vibe', number: '02' },
-  { id: 'location', label: 'Location', number: '03' },
-  { id: 'overview', label: 'The mix', number: '04' },
-  { id: 'recommendations', label: 'The plan', number: '05' },
-];
-
-const initialPicks: Picks = {
-  budget: ['€10–20'],
-  time: ['2 hours'],
-  mood: ['Social'],
-  categories: ['Food', 'Coffee'],
-  distance: ['Walkable'],
-};
-
-function makeGroupCode(existingCodes: string[] = []): string {
-  const identifier = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
-  const code = `PLANB-${identifier.replace(/-/g, '').slice(0, 8).toUpperCase()}`;
-  return existingCodes.includes(code) ? makeGroupCode(existingCodes) : code;
-}
-
-function makeInviteLink(code: string) {
-  return `${window.location.origin}/join/${code.toLowerCase()}`;
-}
-
 function App() {
-  const [savedGroups, setSavedGroups] = useState<StoredGroup[]>(readStoredGroups);
-  const [inviteCodeFromUrl] = useState(getInviteCodeFromPath);
-  const initialInviteGroup = savedGroups.find((group) => group.code === inviteCodeFromUrl);
-  const [screen, setScreen] = useState<Screen>(() => inviteCodeFromUrl ? 'group' : 'welcome');
-  const [groupName, setGroupName] = useState(initialInviteGroup?.name ?? 'Friday-ish crew');
-  const [occasion, setOccasion] = useState('Just because');
-  const [joinMode, setJoinMode] = useState(Boolean(inviteCodeFromUrl));
-  const [groupCreated, setGroupCreated] = useState(Boolean(initialInviteGroup));
-  const [ownerName, setOwnerName] = useState('');
-  const [code, setCode] = useState(inviteCodeFromUrl);
-  const [groupCode, setGroupCode] = useState(initialInviteGroup?.code ?? inviteCodeFromUrl);
-  const [shareLink, setShareLink] = useState(inviteCodeFromUrl ? makeInviteLink(inviteCodeFromUrl) : '');
-  const [joinedMembers, setJoinedMembers] = useState<GroupMember[]>(initialInviteGroup?.members ?? []);
-  const [activeMemberId, setActiveMemberId] = useState('');
-  const [showInvitePanel, setShowInvitePanel] = useState(false);
-  const [joinCodeInput, setJoinCodeInput] = useState('');
-  const [joiningName, setJoiningName] = useState('');
+  const [initialSession] = useState(readSavedSession);
+  const [session, setSession] = useState<GroupSession | null>(initialSession);
+  const [screen, setScreen] = useState<Screen>(() => getInitialScreen(initialSession));
+  const [screenNotice, setScreenNotice] = useState('');
+  const [participantName, setParticipantName] = useState('');
+  const [activeMemberId, setActiveMemberId] = useState(() => {
+    return initialSession?.members.find((member) => !member.preferencesSubmitted)?.id ?? '';
+  });
+  const [editingMemberId, setEditingMemberId] = useState('');
   const [preferenceIndex, setPreferenceIndex] = useState(0);
-  const [picks, setPicks] = useState<Picks>(initialPicks);
-  const [savedVenues, setSavedVenues] = useState<string[]>([]);
+  const [picks, setPicks] = useState<Picks>(() => {
+    return initialSession?.members.find((member) => !member.preferencesSubmitted)?.picks ?? { ...emptyPicks };
+  });
+  const [selectedLocation, setSelectedLocation] = useState<LocationSelection | null>(() => initialSession?.selectedLocation ?? null);
+  const locationSource = selectedLocation?.source ?? null;
+  const [locationQuery, setLocationQuery] = useState(() => initialSession?.selectedLocation?.source === 'manual' ? initialSession.selectedLocation.name : '');
+  const [locationSearchState, setLocationSearchState] = useState<'idle' | 'loading' | 'error' | 'empty'>('idle');
+  const [locationSearchMessage, setLocationSearchMessage] = useState('');
+  const [locationResults, setLocationResults] = useState<LocationSearchResult[]>([]);
+  const [locationMode, setLocationMode] = useState<'current' | 'search' | null>(() => initialSession?.selectedLocation?.source === 'current' ? 'current' : initialSession?.selectedLocation ? 'search' : null);
+  const [gpsState, setGpsState] = useState<'idle' | 'loading' | 'error' | 'success'>(() => initialSession?.selectedLocation?.source === 'current' ? 'success' : 'idle');
+  const [gpsMessage, setGpsMessage] = useState(() => initialSession?.selectedLocation?.source === 'current' ? `Current area selected: ${initialSession.selectedLocation.name}` : '');
+  const locationRequestId = useRef(0);
+  const [places, setPlaces] = useState<OpenStreetMapPlace[]>([]);
+  const [placesLoading, setPlacesLoading] = useState(false);
+  const [placesError, setPlacesError] = useState('');
+  const [placeCategoryFilter, setPlaceCategoryFilter] = useState<PlaceCategory | 'all'>('all');
+  const [savedPlaces, setSavedPlaces] = useState<string[]>([]);
   const [toast, setToast] = useState('');
-  const [selectedLocation, setSelectedLocation] = useState('');
-  const [locationQuery, setLocationQuery] = useState('');
-  const [locationMode, setLocationMode] = useState<'current' | 'search' | null>(null);
-  const [showGpsPrompt, setShowGpsPrompt] = useState(false);
-
-  const currentStep = steps.findIndex((step) => step.id === screen);
-  const currentPreference: PreferenceGroup = preferenceGroups[preferenceIndex];
-  const allPreferencesSubmitted = joinedMembers.length >= 2 && joinedMembers.every((member) => member.preferencesSubmitted);
-  const nextPreferenceMember = joinedMembers.find((member) => member.id === activeMemberId && !member.preferencesSubmitted)
-    ?? joinedMembers.find((member) => !member.preferencesSubmitted);
-
-  function persistGroup(group: StoredGroup) {
-    const storedGroups = readStoredGroups();
-    const updatedGroups = [...storedGroups.filter((stored) => stored.code !== group.code), group];
-    setSavedGroups(updatedGroups);
-    window.localStorage.setItem(groupsStorageKey, JSON.stringify(updatedGroups));
-  }
+  const [activePlaceId, setActivePlaceId] = useState('');
+  const recommendationRequestId = useRef(0);
 
   useEffect(() => {
-    function syncStoredGroups(event: StorageEvent) {
-      if (event.key !== groupsStorageKey || !event.newValue) return;
-      try {
-        const groups = JSON.parse(event.newValue) as StoredGroup[];
-        setSavedGroups(groups);
-        const activeGroup = groups.find((group) => group.code === groupCode);
-        if (activeGroup) {
-          setJoinedMembers(activeGroup.members);
-          setGroupName(activeGroup.name);
-        }
-      } catch {
-        setSavedGroups([]);
-      }
-    }
-
-    window.addEventListener('storage', syncStoredGroups);
-    return () => window.removeEventListener('storage', syncStoredGroups);
-  }, [groupCode]);
-
-  function startGroup(join: boolean) {
-    setJoinMode(join);
-    const nextCode = join ? '' : makeGroupCode(readStoredGroups().map((group) => group.code));
-    setGroupCode(nextCode);
-    setCode(nextCode);
-    setShareLink(nextCode ? makeInviteLink(nextCode) : '');
-    setGroupName('Friday-ish crew');
-    setGroupCreated(false);
-    setOwnerName('');
-    setJoinedMembers([]);
-    setActiveMemberId('');
-    setShowInvitePanel(false);
-    setJoinCodeInput('');
-    setJoiningName('');
-    setScreen('group');
-  }
-
-  function createGroup() {
-    if (!groupName.trim() || !ownerName.trim() || !groupCode) return;
-    const owner = createMemberProfile(ownerName, 0);
-    const group = { code: groupCode, name: groupName.trim(), members: [owner] };
-    persistGroup(group);
-    setJoinedMembers(group.members);
-    setActiveMemberId(owner.id);
-    setGroupCreated(true);
-    setToast(`${owner.name}, your group is ready for invites`);
-    window.setTimeout(() => setToast(''), 2200);
-  }
-
-  function joinWithCode(enteredCode: string, enteredName: string) {
-    const normalized = enteredCode.trim().toUpperCase();
-    const targetGroup = readStoredGroups().find((group) => group.code === normalized);
-    if (!normalized || !targetGroup) {
-      setToast('That group is not saved in this browser. A shared backend is needed across devices.');
-      window.setTimeout(() => setToast(''), 2200);
-      return;
-    }
-
-    if (!enteredName.trim()) {
-      setToast('Enter your name to create your group profile.');
-      window.setTimeout(() => setToast(''), 2200);
-      return;
-    }
-
-    const member = createMemberProfile(enteredName, targetGroup.members.length);
-    const updatedGroup = { ...targetGroup, members: [...targetGroup.members, member] };
-    persistGroup(updatedGroup);
-    setJoinedMembers(updatedGroup.members);
-    setActiveMemberId(member.id);
-    setGroupCode(updatedGroup.code);
-    setGroupName(updatedGroup.name);
-    setShareLink(makeInviteLink(updatedGroup.code));
-    setGroupCreated(true);
-    setJoinMode(false);
-    setJoinCodeInput('');
-    setJoiningName('');
-    setShowInvitePanel(false);
-    setToast(`${member.name} joined ${updatedGroup.name}`);
-    window.setTimeout(() => setToast(''), 2200);
-  }
-
-  function joinExistingGroup() {
-    joinWithCode(code, ownerName);
-  }
-
-  function copyInviteCode() {
-    if (!navigator.clipboard?.writeText) {
-      setToast('Copy is unavailable here. Select the code above to copy it.');
-    } else {
-      void navigator.clipboard.writeText(groupCode).then(() => {
-        setToast('Invite code copied');
-      }).catch(() => setToast('Copy failed. Select the code above to copy it.'));
-    }
-    window.setTimeout(() => setToast(''), 2200);
-  }
-
-  async function shareInvitationLink() {
     try {
-      if (navigator.share) {
-        await navigator.share({ title: `${groupName} on Plan B`, text: 'Join our Plan B group', url: shareLink });
-      } else if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(shareLink);
-        setToast('Invitation link copied. Share it with your friends.');
-        window.setTimeout(() => setToast(''), 2400);
-      } else {
-        setToast('Sharing is unavailable here. Copy the invitation link above.');
-        window.setTimeout(() => setToast(''), 2400);
-      }
-    } catch {
-      setToast('Share was cancelled. You can copy the invitation link instead.');
-      window.setTimeout(() => setToast(''), 2400);
+      if (session) window.localStorage.setItem(sessionStorageKey, JSON.stringify(session));
+      else window.localStorage.removeItem(sessionStorageKey);
+    } catch (error) {
+      console.error('Could not update the saved Plan B session.', error);
+      setToast('This session could not be saved or cleared in this browser.');
     }
-  }
+  }, [session]);
 
-  function startPreferences() {
-    if (joinedMembers.length < 2) return;
-    if (allPreferencesSubmitted) {
-      changeScreen('location');
-      return;
-    }
-    if (nextPreferenceMember) setActiveMemberId(nextPreferenceMember.id);
-    setPreferenceIndex(0);
-    setPicks(initialPicks);
-    setScreen('preferences');
-  }
+  const activeMember = session?.members.find((member) => member.id === activeMemberId);
+  const currentPreference = preferenceGroups[preferenceIndex];
+  const rankedPlaces = rankPlaces(
+    places,
+    session?.members.filter((member) => member.preferencesSubmitted).map((member) => member.picks) ?? [],
+    selectedLocation ?? undefined,
+  );
+  const filteredPlaces = placeCategoryFilter === 'all'
+    ? rankedPlaces
+    : rankedPlaces.filter((place) => place.category === placeCategoryFilter);
+  const currentStep = steps.findIndex((step) => step.id === (screen === 'turn' ? 'preferences' : screen));
 
   function changeScreen(next: Screen) {
+    if (screen === 'location' && next !== 'location') locationRequestId.current += 1;
     setToast('');
     setScreen(next);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
-  function goBack() {
-    if (screen === 'preferences' && preferenceIndex > 0) {
-      setPreferenceIndex((index) => index - 1);
-      return;
-    }
-    const previous: Partial<Record<Screen, Screen>> = {
-      group: 'welcome',
-      preferences: 'group',
-      location: 'preferences',
-      overview: 'location',
-      recommendations: 'overview',
-    };
-    if (previous[screen]) changeScreen(previous[screen]!);
+  function startGroup() {
+    setSession(null);
+    setParticipantName('');
+    setActiveMemberId('');
+    setEditingMemberId('');
+    setSelectedLocation(null);
+    setLocationQuery('');
+    setLocationResults([]);
+    setLocationSearchState('idle');
+    setLocationSearchMessage('');
+    setLocationMode(null);
+    setGpsState('idle');
+    setGpsMessage('');
+    setPlaces([]);
+    setPlacesError('');
+    setPlacesLoading(false);
+    setPlaceCategoryFilter('all');
+    setSavedPlaces([]);
+    setScreenNotice('');
+    changeScreen('group');
+  }
+
+  function createGroup(name: string, participantCount: number, occasion: string) {
+    setSession({ name: name.trim(), participantCount, occasion, selectedLocation: null, members: [] });
+    setParticipantName('');
+    changeScreen('turn');
+  }
+
+  function startParticipant() {
+    if (!session || !participantName.trim()) return;
+    const member = createMember(participantName, session.members.length);
+    setSession({ ...session, members: [...session.members, member] });
+    setActiveMemberId(member.id);
+    setEditingMemberId('');
+    setPicks({ ...emptyPicks });
+    setPreferenceIndex(0);
+    changeScreen('preferences');
+  }
+
+  function editMember(member: GroupMember) {
+    setActiveMemberId(member.id);
+    setEditingMemberId(member.id);
+    setParticipantName(member.name);
+    setPicks({ ...member.picks });
+    setPreferenceIndex(0);
+    changeScreen('preferences');
   }
 
   function togglePick(group: PreferenceGroup, label: string) {
     setPicks((current) => {
       const selected = current[group.key] ?? [];
-      const isMultiSelect = group.key === 'categories';
       const updated = selected.includes(label)
         ? selected.filter((item) => item !== label)
-        : isMultiSelect ? [...selected, label] : [label];
+        : group.key === 'categories' ? [...selected, label] : [label];
       return { ...current, [group.key]: updated };
     });
   }
@@ -310,42 +252,211 @@ function App() {
   function advancePreference() {
     if (preferenceIndex < preferenceGroups.length - 1) {
       setPreferenceIndex((index) => index + 1);
-    } else {
-      const activeMember = joinedMembers.find((member) => member.id === activeMemberId);
-      if (activeMember) {
-        const updatedMember = {
-          ...activeMember,
-          budget: picks.budget?.join(', ') ?? '',
-          time: picks.time?.join(', ') ?? '',
-          mood: picks.mood?.join(', ') ?? '',
-          categories: picks.categories?.join(', ') ?? '',
-          distance: picks.distance?.join(', ') ?? '',
-          preferencesSubmitted: true,
-        };
-        const updatedMembers = joinedMembers.map((member) => member.id === activeMemberId ? updatedMember : member);
-        const updatedGroup = { code: groupCode, name: groupName, members: updatedMembers };
-        persistGroup(updatedGroup);
-        setJoinedMembers(updatedMembers);
-        const nextMember = updatedMembers.find((member) => !member.preferencesSubmitted);
-        if (nextMember) {
-          setActiveMemberId(nextMember.id);
-          setScreen('group');
-          setToast(`${updatedMember.name}'s preferences are in. ${nextMember.name} is up next.`);
-          window.setTimeout(() => setToast(''), 2600);
-          return;
-        }
-      }
-      changeScreen('location');
+      return;
+    }
+    if (!session || !activeMemberId) return;
+    const updatedMembers = session.members.map((member) =>
+      member.id === activeMemberId ? { ...member, picks, preferencesSubmitted: true } : member,
+    );
+    setSession({ ...session, members: updatedMembers });
+    setEditingMemberId('');
+    if (activeMemberId === editingMemberId) {
+      setScreenNotice(`${activeMember?.name ?? 'Participant'}'s answers have been updated.`);
+      changeScreen('overview');
+      return;
+    }
+    if (updatedMembers.length < session.participantCount) {
+      setParticipantName('');
+      setActiveMemberId('');
+      setScreenNotice(`${updatedMembers[updatedMembers.length - 1].name}'s preferences are saved. Pass the device to the next person.`);
+      changeScreen('turn');
+      return;
+    }
+    setScreenNotice('Everyone’s preferences are in. Choose a meet-up area, then review the group before finding your plan.');
+    changeScreen('location');
+  }
+
+  function saveLocation(location: LocationSelection) {
+    if (!location.name.trim() || !Number.isFinite(location.lat) || !Number.isFinite(location.lon)) return;
+    locationRequestId.current += 1;
+    setSelectedLocation(location);
+    setSession((current) => current ? { ...current, selectedLocation: location } : current);
+    setLocationMode(location.source === 'current' ? 'current' : 'search');
+    setLocationQuery(location.source === 'manual' ? location.name : '');
+    setLocationResults([]);
+    setLocationSearchState('idle');
+    setLocationSearchMessage('');
+    if (location.source === 'manual') {
+      setGpsState('idle');
+      setGpsMessage('');
     }
   }
 
-  function toggleSaved(venue: Venue) {
-    const isSaved = savedVenues.includes(venue.id);
-    setSavedVenues((current) => isSaved
-      ? current.filter((id) => id !== venue.id)
-      : [...current, venue.id]);
-    setToast(isSaved ? `${venue.name} removed from your shortlist` : `${venue.name} added to your shortlist`);
+  function updateLocationQuery(query: string) {
+    locationRequestId.current += 1;
+    setLocationQuery(query);
+    setLocationResults([]);
+    setLocationSearchState('idle');
+    setLocationSearchMessage('');
+  }
+
+  async function searchForLocation() {
+    const query = locationQuery.trim();
+    if (!query) {
+      setLocationSearchState('error');
+      setLocationSearchMessage('Enter a city or neighbourhood to search.');
+      return;
+    }
+    const requestId = ++locationRequestId.current;
+    setLocationMode('search');
+    setLocationSearchState('loading');
+    setLocationSearchMessage('');
+    setLocationResults([]);
+    try {
+      const results = await searchLocations(query);
+      if (requestId !== locationRequestId.current) return;
+      setLocationResults(results);
+      setLocationSearchState(results.length ? 'idle' : 'empty');
+      setLocationSearchMessage(results.length ? '' : 'No matching places found. Try a nearby city or a more specific name.');
+    } catch (error) {
+      if (requestId !== locationRequestId.current) return;
+      console.error('Could not search for a location.', error);
+      setLocationSearchState('error');
+      setLocationSearchMessage(error instanceof Error && !error.message.includes('Failed to fetch')
+        ? error.message
+        : 'Location search could not connect. Check your connection or try again later.');
+    }
+  }
+
+  function useCurrentLocation() {
+    const requestId = ++locationRequestId.current;
+    setLocationMode('current');
+    setGpsState('loading');
+    setGpsMessage('Waiting for your browser’s location permission…');
+    setLocationSearchState('idle');
+    setLocationSearchMessage('');
+    if (!navigator.geolocation) {
+      setGpsState('error');
+      setGpsMessage('Location is not available in this browser. Enter a city or neighbourhood instead.');
+      return;
+    }
+
+    try {
+      navigator.geolocation.getCurrentPosition(async ({ coords }) => {
+        if (requestId !== locationRequestId.current) return;
+        setGpsMessage('Location found. Looking up your area…');
+        try {
+          const placeName = await reverseGeocodeLocation(coords.latitude, coords.longitude);
+          if (requestId !== locationRequestId.current) return;
+          saveLocation({ name: placeName, lat: coords.latitude, lon: coords.longitude, source: 'current' });
+          setGpsState('success');
+          setGpsMessage(`Current area selected: ${placeName}`);
+        } catch (error) {
+          if (requestId !== locationRequestId.current) return;
+          console.error('Could not reverse-geocode the current location.', error);
+          setGpsState('error');
+          setGpsMessage(error instanceof Error && !error.message.includes('Failed to fetch')
+            ? error.message
+            : 'We found your location, but could not look up its area. Enter a city or neighbourhood instead.');
+        }
+      }, (error) => {
+        if (requestId !== locationRequestId.current) return;
+        setGpsState('error');
+        if (error.code === error.PERMISSION_DENIED) {
+          setGpsMessage('Location permission was denied. Allow it in your browser settings or enter an area manually.');
+        } else if (error.code === error.POSITION_UNAVAILABLE) {
+          setGpsMessage('Your device could not determine a location. Enter an area manually or try again.');
+        } else if (error.code === error.TIMEOUT) {
+          setGpsMessage('The location request timed out. Try again or enter an area manually.');
+        } else {
+          setGpsMessage('We could not get your location. Enter an area manually or try again.');
+        }
+      }, { enableHighAccuracy: false, timeout: 12000, maximumAge: 60000 });
+    } catch (error) {
+      if (requestId !== locationRequestId.current) return;
+      console.error('Could not start the browser location request.', error);
+      setGpsState('error');
+      setGpsMessage('Your browser could not start location detection. Enter an area manually or try again.');
+    }
+  }
+
+  function focusManualLocation() {
+    locationRequestId.current += 1;
+    setLocationMode('search');
+    setLocationResults([]);
+    setLocationSearchState('idle');
+    setLocationSearchMessage('');
+    if (gpsState === 'loading') {
+      setGpsState('idle');
+      setGpsMessage('');
+    }
+  }
+
+  function toggleSaved(place: OpenStreetMapPlace) {
+    const isSaved = savedPlaces.includes(place.id);
+    setSavedPlaces((current) => isSaved
+      ? current.filter((id) => id !== place.id)
+      : [...current, place.id]);
+    setToast(isSaved ? `${place.name} removed from your shortlist` : `${place.name} added to your shortlist`);
     window.setTimeout(() => setToast(''), 2400);
+  }
+
+  async function findOurPlan() {
+    if (!selectedLocation) return;
+    const requestId = ++recommendationRequestId.current;
+    setPlaces([]);
+    setPlacesLoading(true);
+    setPlacesError('');
+    setActivePlaceId('');
+    setPlaceCategoryFilter('all');
+    changeScreen('recommendations');
+    try {
+      const results = await fetchNearbyPlaces(selectedLocation.lat, selectedLocation.lon);
+      if (requestId !== recommendationRequestId.current) return;
+      setPlaces(results);
+      setActivePlaceId(results[0]?.id ?? '');
+    } catch (error) {
+      if (requestId !== recommendationRequestId.current) return;
+      console.error('Could not retrieve nearby OpenStreetMap places.', error);
+      setPlacesError(error instanceof Error && !error.message.includes('Failed to fetch')
+        ? error.message
+        : 'Nearby places could not be loaded. Check your connection and try again.');
+    } finally {
+      if (requestId === recommendationRequestId.current) setPlacesLoading(false);
+    }
+  }
+
+  function retryPlaceSearch() {
+    if (selectedLocation) void findOurPlan();
+  }
+
+  function goBack() {
+    if (screen === 'preferences' && preferenceIndex > 0) {
+      setPreferenceIndex((index) => index - 1);
+      return;
+    }
+    if (screen === 'preferences' && !editingMemberId && session && activeMemberId) {
+      setSession({ ...session, members: session.members.filter((member) => member.id !== activeMemberId) });
+      setActiveMemberId('');
+      changeScreen('turn');
+      return;
+    }
+    if (screen === 'location' && session) {
+      const lastMember = [...session.members].reverse().find((member) => member.preferencesSubmitted);
+      if (lastMember) {
+        editMember(lastMember);
+        return;
+      }
+    }
+    const previous: Partial<Record<Screen, Screen>> = {
+      group: 'welcome',
+      turn: 'group',
+      preferences: editingMemberId ? 'overview' : session?.members.length === 1 ? 'turn' : 'turn',
+      location: 'preferences',
+      overview: 'location',
+      recommendations: 'overview',
+    };
+    if (previous[screen]) changeScreen(previous[screen]!);
   }
 
   return (
@@ -355,13 +466,11 @@ function App() {
           <span className="brand-mark" aria-hidden="true"><span>B</span><ArrowDownLeft size={15} strokeWidth={3} /></span>
           <span className="brand-name">plan b<span>.</span></span>
         </button>
-        <div className="topbar-center"><span className="live-dot" /> A little less group chat. A lot more going out.</div>
-        {screen !== 'welcome' && joinedMembers.length > 0 && (
-          <button className="avatar-stack" onClick={() => joinedMembers.length > 1 && changeScreen('overview')} aria-label="View your group" disabled={joinedMembers.length < 2}>
-            {joinedMembers.map((member) => {
-              return <span key={member.id} className={`mini-avatar mini-avatar-${member.color}`} aria-label={member.name} title={member.name}>{member.initials}</span>;
-            })}
-          </button>
+        <div className="topbar-center"><span className="live-dot" /> One device. Everyone gets a turn.</div>
+        {session && session.members.length > 0 && (
+          <div className="avatar-stack" aria-label={`${session.members.length} participants`}>
+            {session.members.map((member) => <span key={member.id} className={`mini-avatar mini-avatar-${member.color}`} title={member.name}>{member.initials}</span>)}
+          </div>
         )}
       </header>
 
@@ -371,15 +480,8 @@ function App() {
             <button className="back-button" onClick={goBack} aria-label="Go back"><ArrowLeft size={18} /></button>
             <div className="step-track" aria-label="Your planning progress">
               {steps.map((step, index) => (
-                <button
-                  key={step.id}
-                  className={`step-item ${index === currentStep ? 'is-current' : ''} ${index < currentStep ? 'is-done' : ''}`}
-                  onClick={() => index < currentStep && changeScreen(step.id)}
-                  disabled={index >= currentStep}
-                  aria-current={index === currentStep ? 'step' : undefined}
-                >
-                  <span className="step-dot">{index < currentStep ? <Check size={12} /> : step.number}</span>
-                  <span>{step.label}</span>
+                <button key={step.id} className={`step-item ${index === currentStep ? 'is-current' : ''} ${index < currentStep ? 'is-done' : ''}`} onClick={() => index < currentStep && step.id !== 'group' && changeScreen(step.id)} disabled={index >= currentStep || (step.id === 'group' && Boolean(session))} aria-current={index === currentStep ? 'step' : undefined}>
+                  <span className="step-dot">{index < currentStep ? <Check size={12} /> : step.number}</span><span>{step.label}</span>
                 </button>
               ))}
             </div>
@@ -387,75 +489,74 @@ function App() {
           </div>
         )}
 
-        {screen === 'welcome' && (
-          <WelcomeScreen onCreate={() => startGroup(false)} onJoin={() => startGroup(true)} />
-        )}
-
-        {screen === 'group' && (
-          <GroupScreen
-            joinMode={joinMode}
-            groupName={groupName}
-            setGroupName={setGroupName}
-            code={code}
-            setCode={setCode}
-            occasion={occasion}
-            setOccasion={setOccasion}
-            ownerName={ownerName}
-            setOwnerName={setOwnerName}
-            onContinue={startPreferences}
-            onCreateGroup={createGroup}
-            onJoinExisting={joinExistingGroup}
-            joinedMembers={joinedMembers}
-            groupCreated={groupCreated}
-            allPreferencesSubmitted={allPreferencesSubmitted}
-            nextPreferenceName={nextPreferenceMember?.name ?? ''}
-            shareLink={shareLink}
-            groupCode={groupCode}
-            showInvitePanel={showInvitePanel}
-            setShowInvitePanel={setShowInvitePanel}
-            joinCodeInput={joinCodeInput}
-            setJoinCodeInput={setJoinCodeInput}
-            joiningName={joiningName}
-            setJoiningName={setJoiningName}
-            joinWithCode={() => joinWithCode(joinCodeInput, joiningName)}
-            copyInviteCode={copyInviteCode}
-            shareInvitationLink={shareInvitationLink}
-            prototypeNote={<>Prototype only: groups are saved in this browser’s local storage. Friends on other devices are not connected; shared membership needs a backend.</>}
+        {screen === 'welcome' && <WelcomeScreen onCreate={startGroup} />}
+        {screen === 'group' && <GroupCreationScreen onCreate={createGroup} />}
+        {screen === 'turn' && session && (
+          <ParticipantTurnScreen
+            group={session}
+            participantName={participantName}
+            onNameChange={setParticipantName}
+            onContinue={startParticipant}
+            notice={screenNotice}
           />
         )}
-
-        {screen === 'preferences' && (
+        {screen === 'preferences' && currentPreference && activeMember && (
           <PreferencesScreen
             preference={currentPreference}
             index={preferenceIndex}
             picks={picks}
+            participantName={activeMember.name}
+            participantNumber={session?.members.findIndex((member) => member.id === activeMember.id) ?? 0}
+            participantCount={session?.participantCount ?? 1}
+            editing={Boolean(editingMemberId)}
             onToggle={togglePick}
             onNext={advancePreference}
           />
         )}
-
         {screen === 'location' && (
           <LocationScreen
             selectedLocation={selectedLocation}
+            locationSource={locationSource}
             locationQuery={locationQuery}
+            locationResults={locationResults}
+            locationSearchState={locationSearchState}
+            locationSearchMessage={locationSearchMessage}
             locationMode={locationMode}
-            showGpsPrompt={showGpsPrompt}
-            onUseCurrent={() => { setLocationMode('current'); setShowGpsPrompt(true); }}
-            onAllowDemo={() => { setSelectedLocation(demoLocation); setShowGpsPrompt(false); }}
-            onDismissGps={() => setShowGpsPrompt(false)}
-            onSearchFocus={() => setLocationMode('search')}
-            onQueryChange={setLocationQuery}
-            onSelectLocation={(location) => { setSelectedLocation(location); setLocationMode('search'); }}
+            gpsState={gpsState}
+            gpsMessage={gpsMessage}
+            notice={screenNotice}
+            onUseCurrent={useCurrentLocation}
+            onSearchFocus={focusManualLocation}
+            onQueryChange={updateLocationQuery}
+            onSearch={searchForLocation}
+            onSelectLocation={(result) => saveLocation({ ...result, source: 'manual' })}
             onContinue={() => changeScreen('overview')}
           />
         )}
-
-        {screen === 'overview' && (
-          <OverviewScreen groupName={groupName || 'Friday-ish crew'} userPicks={picks} location={selectedLocation} joinedMembers={joinedMembers} activeMemberId={activeMemberId} onContinue={() => changeScreen('recommendations')} />
+        {screen === 'overview' && session && (
+          <OverviewScreen
+            group={session}
+            location={selectedLocation?.name ?? ''}
+            notice={screenNotice}
+            onEdit={editMember}
+            onContinue={findOurPlan}
+          />
         )}
-
-        {screen === 'recommendations' && (
-          <RecommendationsScreen location={selectedLocation} saved={savedVenues} onToggleSaved={toggleSaved} />
+        {screen === 'recommendations' && selectedLocation && (
+          <RecommendationsScreen
+            location={selectedLocation}
+            places={filteredPlaces}
+            allPlaceCount={rankedPlaces.length}
+            categoryFilter={placeCategoryFilter}
+            loading={placesLoading}
+            error={placesError}
+            saved={savedPlaces}
+            activePlaceId={activePlaceId}
+            onCategoryFilterChange={setPlaceCategoryFilter}
+            onSelectPlace={setActivePlaceId}
+            onToggleSaved={toggleSaved}
+            onRetry={retryPlaceSearch}
+          />
         )}
       </main>
 
@@ -463,214 +564,100 @@ function App() {
         <span>Plan B <span className="footer-spark">✳</span> made for plans that bring everyone along.</span>
         <span>Different plans. One good choice.</span>
       </footer>
-
       {toast && <div className="toast" role="status"><CheckCircle2 size={17} /> {toast}</div>}
     </div>
   );
 }
 
-function ScreenHeading({
-  eyebrow,
-  title,
-  description,
-  accent,
-}: {
-  eyebrow: string;
-  title: React.ReactNode;
-  description: string;
-  accent: string;
-}) {
-  return (
-    <div className="screen-heading">
-      <div className={`eyebrow eyebrow-${accent}`}><span className="eyebrow-star">✳</span> {eyebrow}</div>
-      <h1>{title}</h1>
-      <p>{description}</p>
-    </div>
-  );
+function ScreenHeading({ eyebrow, title, description, accent }: { eyebrow: string; title: ReactNode; description: string; accent: string }) {
+  return <div className="screen-heading"><div className={`eyebrow eyebrow-${accent}`}><span className="eyebrow-star">✳</span> {eyebrow}</div><h1>{title}</h1><p>{description}</p></div>;
 }
 
-function WelcomeScreen({ onCreate, onJoin }: { onCreate: () => void; onJoin: () => void }) {
+function WelcomeScreen({ onCreate }: { onCreate: () => void }) {
   return (
     <section className="welcome-layout">
       <div className="welcome-copy">
         <div className="welcome-kicker"><span className="kicker-star">✳</span> GOOD PLANS, ZERO GROUP CHAT SPIRALS</div>
         <h1>Different plans.<br />One <span>good choice.</span></h1>
-        <p className="welcome-description">Your group already exists. Plan B helps your friends compare tastes, budgets and time so you can decide on one spot everyone actually enjoys.</p>
-        <div className="welcome-actions">
-          <button className="button button-primary" onClick={onCreate}>Make a plan <ArrowRight size={18} /></button>
-          <button className="button button-secondary" onClick={onJoin}><UsersRound size={17} /> Join a group</button>
-        </div>
-        <div className="welcome-proof"><UsersRound size={20} /><span>Built for real friends planning an outing together.</span></div>
+        <p className="welcome-description">Pass one phone around your crew. Everyone shares their vibe, then Plan B finds a plan that works for the group.</p>
+        <div className="welcome-actions"><button className="button button-primary" onClick={onCreate}>Make a plan <ArrowRight size={18} /></button></div>
+        <div className="welcome-proof"><UsersRound size={20} /><span>One shared device, with a private turn for everyone.</span></div>
       </div>
       <div className="welcome-art" aria-label="Illustration of friends bringing different preferences to a shared plan">
-        <div className="art-scribble scribble-top">your crew<br />already knows each other ↗</div>
-        <div className="art-sunburst">✳</div>
-        <div className="art-card art-card-back"><span className="art-card-label">THE GROUP PICK</span><div className="art-food-row"><span>🍜</span><span>🌮</span><span>🥟</span></div><strong>Everyone gets<br />a little something.</strong><div className="art-match"><span>FIRST STEP</span><b>01</b></div></div>
-        <div className="art-ticket"><span>PLAN A</span><span>meh.</span><X size={15} /></div>
-        <div className="art-ticket ticket-good"><span>PLAN B</span><span>oh, yes.</span><Sparkles size={16} /></div>
-        <div className="art-sticker">no more<br />“idk u pick”</div>
-        <div className="art-scribble scribble-bottom">your people<br />1 actually good plan</div>
+        <div className="art-scribble scribble-top">one phone<br />your whole crew ↗</div><div className="art-sunburst">✳</div>
+        <div className="art-card art-card-back"><span className="art-card-label">THE GROUP PICK</span><div className="art-food-row"><span>🍜</span><span>🌮</span><span>🥟</span></div><strong>Everyone gets<br />a little something.</strong><div className="art-match"><span>PEOPLE, ONE PLAN</span><b>01</b></div></div>
+        <div className="art-ticket"><span>PLAN A</span><span>meh.</span><span>×</span></div><div className="art-ticket ticket-good"><span>PLAN B</span><span>oh, yes.</span><Sparkles size={16} /></div>
+        <div className="art-sticker">everyone<br />gets a turn</div><div className="art-scribble scribble-bottom">your people<br />1 actually good plan</div>
       </div>
-      <div className="welcome-strip"><span><Sparkles size={16} /> FRIENDS ONLY</span><span>Budget · mood · time · the whole vibe</span><span>ONE GOOD PLAN <ArrowRight size={15} /></span></div>
+      <div className="welcome-strip"><span><UsersRound size={16} /> ONE SHARED DEVICE</span><span>Budget · mood · time · the whole vibe</span><span>ONE GOOD PLAN <ArrowRight size={15} /></span></div>
     </section>
   );
 }
 
-function GroupScreen({
-  joinMode,
-  groupName,
-  setGroupName,
-  code,
-  setCode,
-  ownerName,
-  setOwnerName,
-  occasion,
-  setOccasion,
-  onContinue,
-  onCreateGroup,
-  onJoinExisting,
-  joinedMembers,
-  groupCreated,
-  allPreferencesSubmitted,
-  nextPreferenceName,
-  shareLink,
-  groupCode,
-  showInvitePanel,
-  setShowInvitePanel,
-  joinCodeInput,
-  setJoinCodeInput,
-  joiningName,
-  setJoiningName,
-  joinWithCode,
-  copyInviteCode,
-  shareInvitationLink,
-  prototypeNote,
-}: {
-  joinMode: boolean;
-  groupName: string;
-  setGroupName: (name: string) => void;
-  code: string;
-  setCode: (code: string) => void;
-  ownerName: string;
-  setOwnerName: (name: string) => void;
-  occasion: string;
-  setOccasion: (occasion: string) => void;
-  onContinue: () => void;
-  onCreateGroup: () => void;
-  onJoinExisting: () => void;
-  joinedMembers: GroupMember[];
-  groupCreated: boolean;
-  allPreferencesSubmitted: boolean;
-  nextPreferenceName: string;
-  shareLink: string;
-  groupCode: string;
-  showInvitePanel: boolean;
-  setShowInvitePanel: (value: boolean) => void;
-  joinCodeInput: string;
-  setJoinCodeInput: (value: string) => void;
-  joiningName: string;
-  setJoiningName: (value: string) => void;
-  joinWithCode: () => void;
-  copyInviteCode: () => void;
-  shareInvitationLink: () => void;
-  prototypeNote: React.ReactNode;
-}) {
+function GroupCreationScreen({ onCreate }: { onCreate: (name: string, count: number, occasion: string) => void }) {
+  const [name, setName] = useState('Friday-ish crew');
+  const [participantCount, setParticipantCount] = useState(4);
+  const [occasion, setOccasion] = useState('Just because');
   return (
     <section className="content-page group-page">
-      <ScreenHeading eyebrow={joinMode ? 'JOIN YOUR CREW' : 'CREATE YOUR GROUP'} accent="pink" title={joinMode ? <>Use your<br /><span className="pink-text">group code.</span></> : <>Your crew,<br /><span className="pink-text">your rules.</span></>} description={joinMode ? 'Already got an invite? Pop in the code and jump straight in.' : 'Build a private plan with the people you actually want there.'} />
+      <ScreenHeading eyebrow="CREATE YOUR GROUP" accent="pink" title={<>Your crew,<br /><span className="pink-text">your rules.</span></>} description="Set up your shared-device plan. Then pass the screen around so everyone can add their preferences." />
       <div className="form-layout">
         <div className="form-panel">
-          {joinMode ? (
-            <>
-              <label className="field-label" htmlFor="joiner-name">YOUR NAME
-                <input id="joiner-name" className="text-input" value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="Enter your name" maxLength={32} />
-              </label>
-              <label className="field-label" htmlFor="group-code">GROUP CODE
-                <input id="group-code" className="text-input code-input" value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="Paste your invitation code" />
-              </label>
-              <p className="prototype-note">{prototypeNote}</p>
-            </>
-          ) : (
-            <>
-              <label className="field-label" htmlFor="group-name">WHAT SHOULD WE CALL YOUR GROUP?
-                <input id="group-name" className="text-input" value={groupName} onChange={(event) => setGroupName(event.target.value)} placeholder="e.g. Friday-ish crew" maxLength={32} />
-              </label>
-              {!groupCreated && <label className="field-label group-owner-field" htmlFor="owner-name">YOUR NAME
-                <input id="owner-name" className="text-input" value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="Enter your name" maxLength={32} />
-              </label>}
-
-              <button type="button" className="button button-secondary invite-open-button" onClick={() => setShowInvitePanel(true)} disabled={!groupCreated}><UsersRound size={17} /> Invite Friends</button>
-              {!groupCreated && <p className="invite-prerequisite">Create your group first to generate its private invitation code.</p>}
-
-              {showInvitePanel && (
-                <div className="invite-modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setShowInvitePanel(false)}>
-                  <section className="invite-modal" role="dialog" aria-modal="true" aria-labelledby="invite-modal-title">
-                    <button type="button" className="invite-modal-close" onClick={() => setShowInvitePanel(false)} aria-label="Close invitation modal"><X size={18} /></button>
-                    <div className="eyebrow eyebrow-pink"><span className="eyebrow-star">✳</span> YOUR PRIVATE GROUP</div>
-                    <h2 id="invite-modal-title">Bring your people in.</h2>
-                    <p>Share this invitation with friends you already know. They can join with their own name and profile.</p>
-                    <div className="share-link-box invite-code-box">
-                      <div className="share-link-header"><span>GROUP INVITE CODE</span><span className="share-badge">{groupCode}</span></div>
-                      <button type="button" className="button button-secondary share-copy" onClick={copyInviteCode}><Check size={16} /> Copy Code</button>
-                    </div>
-                    <label className="field-label" htmlFor="group-invite-link">INVITATION LINK
-                      <input id="group-invite-link" readOnly value={shareLink} className="text-input" />
-                    </label>
-                    <button type="button" className="button button-primary share-invitation-button" onClick={shareInvitationLink}><UsersRound size={16} /> Share Invitation Link</button>
-                    <p className="prototype-note modal-prototype-note">{prototypeNote}</p>
-                    <div className="modal-join-section">
-                      <h3>Join Group</h3>
-                      <label className="field-label" htmlFor="friend-name">YOUR NAME
-                        <input id="friend-name" className="text-input" value={joiningName} onChange={(event) => setJoiningName(event.target.value)} placeholder="Enter your name" maxLength={32} />
-                      </label>
-                      <label className="field-label" htmlFor="friend-code">GROUP CODE
-                        <input id="friend-code" className="text-input code-input" value={joinCodeInput} onChange={(event) => setJoinCodeInput(event.target.value.toUpperCase())} placeholder="Enter the group code" />
-                      </label>
-                      <button type="button" className="button button-primary" onClick={joinWithCode} disabled={!joiningName.trim() || !joinCodeInput.trim()}>Join Group</button>
-                    </div>
-                  </section>
-                </div>
-              )}
-
-              <fieldset className="occasion-fieldset">
-                <legend>WHAT ARE WE CELEBRATING? <span>(OR NOT)</span></legend>
-                <div className="occasion-grid">
-                  {occasions.map(({ label, icon: Icon, color }) => (
-                    <button key={label} type="button" className={`occasion-option ${occasion === label ? 'selected' : ''}`} onClick={() => setOccasion(label)} aria-pressed={occasion === label}>
-                      <span className={`choice-icon choice-${color}`}><Icon size={19} /></span>{label}{occasion === label && <Check size={15} className="occasion-check" />}
-                    </button>
-                  ))}
-                </div>
-              </fieldset>
-            </>
-          )}
-          {!joinMode && groupCreated && joinedMembers.length < 2 && <div className="group-waiting-message" role="status">Your crew is waiting for you to invite your friends!</div>}
-          {!joinMode && groupCreated && joinedMembers.length >= 2 && !allPreferencesSubmitted && <div className="group-waiting-message" role="status">Waiting for every member to share their preferences before group matching.</div>}
-          <button className="button button-primary form-submit" onClick={joinMode ? onJoinExisting : groupCreated ? onContinue : onCreateGroup} disabled={joinMode ? !code.trim() || !ownerName.trim() : groupCreated ? joinedMembers.length < 2 : !groupName.trim() || !ownerName.trim()}>{joinMode ? 'Join Group' : groupCreated ? allPreferencesSubmitted ? 'Choose a location' : `Continue with ${nextPreferenceName || 'member'}’s preferences` : 'Create group'}</button>
-          <div className="form-note"><Sparkles size={15} /> Friends only. No stranger matching here.</div>
+          <label className="field-label" htmlFor="group-name">WHAT SHOULD WE CALL YOUR GROUP?
+            <input id="group-name" className="text-input" value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Friday-ish crew" maxLength={32} />
+          </label>
+          <label className="field-label participant-count-label" htmlFor="participant-count">HOW MANY PEOPLE ARE PLANNING?
+            <select id="participant-count" className="text-input participant-count-input" value={participantCount} onChange={(event) => setParticipantCount(Number(event.target.value))}>
+              {Array.from({ length: 7 }, (_, index) => index + 2).map((count) => <option key={count} value={count}>{count} people</option>)}
+            </select>
+          </label>
+          <fieldset className="occasion-fieldset">
+            <legend>WHAT ARE WE CELEBRATING? <span>(OR NOT)</span></legend>
+            <div className="occasion-grid">{[
+              { label: 'Just because', icon: Sparkles, color: 'lime' },
+              { label: 'Birthday', icon: UsersRound, color: 'pink' },
+              { label: 'Coffee catch-up', icon: Coffee, color: 'peach' },
+              { label: 'After hours', icon: Wine, color: 'purple' },
+            ].map(({ label, icon: Icon, color }) => <button key={label} type="button" className={`occasion-option ${occasion === label ? 'selected' : ''}`} onClick={() => setOccasion(label)} aria-pressed={occasion === label}><span className={`choice-icon choice-${color}`}><Icon size={19} /></span>{label}{occasion === label && <Check size={15} className="occasion-check" />}</button>)}</div>
+          </fieldset>
+          <button className="button button-primary form-submit" onClick={() => onCreate(name, participantCount, occasion)} disabled={!name.trim()}>Create group <ArrowRight size={18} /></button>
+          <div className="form-note"><UsersRound size={15} /> Everyone enters their own answers on this device.</div>
         </div>
-        <aside className="group-aside"><span className="aside-doodle">✳</span><div className="aside-label">YOUR CREW · {joinedMembers.length}</div><h2>Already know<br />who’s in <em>the group.</em></h2><p>Only people who create a profile and join with this group’s link or code appear here.</p><div className="aside-member-row">{joinedMembers.map((member) => <span key={member.id} className={`mini-member-pill mini-member-${member.color}`}>{member.name}</span>)}</div>{!joinedMembers.length && <p className="member-empty">Create a group or enter an invitation code to see its members.</p>}</aside>
+        <aside className="group-aside"><span className="aside-doodle">✳</span><div className="aside-label">YOUR CREW · {participantCount}</div><h2>One device.<br />Everyone gets <em>a turn.</em></h2><p>No invite links or group codes. Hand the same phone or computer to each person, one at a time.</p></aside>
       </div>
     </section>
   );
 }
 
-function PreferencesScreen({
-  preference,
-  index,
-  picks,
-  onToggle,
-  onNext,
-}: {
-  preference: PreferenceGroup;
-  index: number;
-  picks: Picks;
-  onToggle: (group: PreferenceGroup, label: string) => void;
-  onNext: () => void;
+function ParticipantTurnScreen({ group, participantName, onNameChange, onContinue, notice }: { group: GroupSession; participantName: string; onNameChange: (name: string) => void; onContinue: () => void; notice: string }) {
+  const personNumber = group.members.findIndex((member) => !member.preferencesSubmitted) >= 0
+    ? group.members.findIndex((member) => !member.preferencesSubmitted) + 1
+    : group.members.length + 1;
+  return (
+    <section className="content-page turn-page">
+      <ScreenHeading eyebrow={`PERSON ${personNumber} OF ${group.participantCount}`} accent="purple" title={<>It’s your <span className="purple-text">turn!</span></>} description={`Welcome to ${group.name}. Add your name and tell us what kind of plan works for you.`} />
+      {notice && <div className="flow-notice" role="status"><CheckCircle2 size={17} />{notice}</div>}
+      <div className="turn-card">
+        <div className="turn-progress"><span style={{ width: `${((personNumber - 1) / group.participantCount) * 100}%` }} /></div>
+        <div className="turn-count"><UsersRound size={17} /> PERSON {personNumber} <span>OF {group.participantCount}</span></div>
+        <label className="field-label" htmlFor="participant-name">YOUR NAME
+          <input id="participant-name" className="text-input" value={participantName} onChange={(event) => onNameChange(event.target.value)} placeholder="Enter your name" maxLength={32} onKeyDown={(event) => event.key === 'Enter' && participantName.trim() && onContinue()} />
+        </label>
+        <p className="one-device-note"><CheckCircle2 size={15} /> Your answers stay on this device and are saved in this browser.</p>
+        <button className="button button-primary form-submit" onClick={onContinue} disabled={!participantName.trim()}>Start my preferences <ArrowRight size={18} /></button>
+      </div>
+    </section>
+  );
+}
+
+function PreferencesScreen({ preference, index, picks, participantName, participantNumber, participantCount, editing, onToggle, onNext }: {
+  preference: PreferenceGroup; index: number; picks: Picks; participantName: string; participantNumber: number; participantCount: number; editing: boolean;
+  onToggle: (group: PreferenceGroup, label: string) => void; onNext: () => void;
 }) {
   const selected = picks[preference.key] ?? [];
   return (
     <section className="content-page preferences-page">
+      <div className="participant-step-label">{editing ? `EDITING ${participantName.toUpperCase()}’S ANSWERS` : `PERSON ${participantNumber + 1} OF ${participantCount} · ${participantName.toUpperCase()}`}</div>
       <div className="preference-intro">
         <ScreenHeading eyebrow={`THE VIBE CHECK · ${String(index + 1).padStart(2, '0')} / ${preferenceGroups.length}`} accent="purple" title={<>{preference.title.split('?')[0]}<span className="purple-text">?</span></>} description={preference.subtitle} />
         <div className="pref-side-note"><span className="note-asterisk">✳</span><span>There are no wrong<br />answers. Except “idk.”</span></div>
@@ -679,197 +666,189 @@ function PreferencesScreen({
       <div className={`preference-options option-count-${preference.choices.length}`}>
         {preference.choices.map(({ label, icon: Icon, color }, choiceIndex) => {
           const isSelected = selected.includes(label);
-          return (
-            <button key={label} className={`preference-option ${isSelected ? 'selected' : ''}`} onClick={() => onToggle(preference, label)} aria-pressed={isSelected} style={{ animationDelay: `${choiceIndex * 50}ms` }}>
-              <span className={`choice-icon choice-${color}`}>
-                {Icon && <Icon size={21} strokeWidth={1.8} />}
-              </span>
-              <span className="option-name">{label}</span>
-              <span className="option-check">{isSelected && <Check size={13} strokeWidth={3} />}</span>
-            </button>
-          );
+          return <button key={label} className={`preference-option ${isSelected ? 'selected' : ''}`} onClick={() => onToggle(preference, label)} aria-pressed={isSelected} style={{ animationDelay: `${choiceIndex * 50}ms` }}><span className={`choice-icon choice-${color}`}>{Icon && <Icon size={21} strokeWidth={1.8} />}</span><span className="option-name">{label}</span><span className="option-check">{isSelected && <Check size={13} strokeWidth={3} />}</span></button>;
         })}
       </div>
-      <div className="preferences-bottom"><span><span className="selection-dot" />{selected.length ? `${selected.length} picked` : 'Pick what feels right'}</span><button className="button button-primary" onClick={onNext}>{index === preferenceGroups.length - 1 ? 'See our mix' : 'Next'} <ArrowRight size={18} /></button></div>
+      <div className="preferences-bottom"><span><span className="selection-dot" />{selected.length ? `${selected.length} picked` : 'Pick what feels right'}</span><button className="button button-primary" onClick={onNext}>{index === preferenceGroups.length - 1 ? editing ? 'Save changes' : 'Finish my turn' : 'Next'} <ArrowRight size={18} /></button></div>
       <div className="preference-footnote">{preference.key === 'categories' ? 'PICK AS MANY AS YOU LIKE' : 'WE’LL FIND THE SWEET SPOT TOGETHER'}</div>
     </section>
   );
 }
 
-function LocationScreen({
-  selectedLocation,
-  locationQuery,
-  locationMode,
-  showGpsPrompt,
-  onUseCurrent,
-  onAllowDemo,
-  onDismissGps,
-  onSearchFocus,
-  onQueryChange,
-  onSelectLocation,
-  onContinue,
-}: {
-  selectedLocation: string;
-  locationQuery: string;
-  locationMode: 'current' | 'search' | null;
-  showGpsPrompt: boolean;
-  onUseCurrent: () => void;
-  onAllowDemo: () => void;
-  onDismissGps: () => void;
-  onSearchFocus: () => void;
-  onQueryChange: (query: string) => void;
-  onSelectLocation: (location: string) => void;
-  onContinue: () => void;
+function LocationScreen({ selectedLocation, locationSource, locationQuery, locationResults, locationSearchState, locationSearchMessage, locationMode, gpsState, gpsMessage, notice, onUseCurrent, onSearchFocus, onQueryChange, onSearch, onSelectLocation, onContinue }: {
+  selectedLocation: LocationSelection | null; locationSource: 'current' | 'manual' | null; locationQuery: string;
+  locationResults: LocationSearchResult[]; locationSearchState: 'idle' | 'loading' | 'error' | 'empty'; locationSearchMessage: string;
+  locationMode: 'current' | 'search' | null; gpsState: 'idle' | 'loading' | 'error' | 'success'; gpsMessage: string; notice: string;
+  onUseCurrent: () => void; onSearchFocus: () => void; onQueryChange: (query: string) => void; onSearch: () => void;
+  onSelectLocation: (location: LocationSearchResult) => void; onContinue: () => void;
 }) {
-  const matchingLocations = suggestedLocations.filter((location) =>
-    location.toLowerCase().includes(locationQuery.trim().toLowerCase()),
-  );
-  const hasExactMatch = suggestedLocations.some((location) => location.toLowerCase() === locationQuery.trim().toLowerCase());
-
   return (
     <section className="content-page location-page">
-      <ScreenHeading eyebrow="PICK YOUR PATCH" accent="purple" title={<>Where’s the <span className="purple-text">meet-up?</span></>} description="We’ll keep the good spots close to wherever your group wants to be." />
+      <ScreenHeading eyebrow="PICK YOUR PATCH" accent="purple" title={<>Where’s the <span className="purple-text">meet-up?</span></>} description="Choose a real area for your group. Use your device location or search OpenStreetMap by city or neighbourhood." />
+      {notice && <div className="flow-notice" role="status"><CheckCircle2 size={17} />{notice}</div>}
+      <div className="one-device-note location-device-note"><UsersRound size={15} /> All participants use this device. No invites or cross-device syncing.</div>
       <div className="location-options">
-        <article className={`location-option ${locationMode === 'current' ? 'is-active' : ''}`}>
+        <article className={`location-option ${locationMode === 'current' ? 'is-active' : ''} ${locationSource === 'current' ? 'is-selected' : ''}`}>
           <div className="location-option-heading"><span className="location-option-icon icon-current"><Navigation size={19} /></span><div><h2>Use my current location</h2><p>Quick, easy, no pin-dropping.</p></div></div>
-          <button className="location-action" onClick={onUseCurrent}><MapPin size={16} /> Use my current location <ChevronRight size={16} /></button>
-          {showGpsPrompt && (
-            <div className="gps-prompt" role="dialog" aria-label="Simulated location permission">
-              <span className="gps-prompt-pin"><MapPin size={20} /></span>
-              <strong>Plan B would like to use your location</strong>
-              <p>This demo uses a pre-loaded location. No GPS is accessed.</p>
-              <div><button onClick={onDismissGps}>Not now</button><button className="gps-allow" onClick={onAllowDemo}>Use demo location</button></div>
-            </div>
-          )}
-          {locationMode === 'current' && !showGpsPrompt && selectedLocation && <div className="location-confirmation"><CheckCircle2 size={15} /> Using demo location: {selectedLocation}</div>}
+          <button className="location-action" onClick={onUseCurrent} disabled={gpsState === 'loading'}>{gpsState === 'loading' ? <LoaderCircle className="location-spinner" size={16} /> : <MapPin size={16} />} {gpsState === 'loading' ? 'Finding your location…' : 'Use my current location'} <ChevronRight size={16} /></button>
+          <p className="location-privacy-note">Your browser will ask permission. Coordinates are sent to Nominatim to find a place name.</p>
+          {gpsMessage && <div className={`location-feedback gps-${gpsState}`} role={gpsState === 'error' ? 'alert' : 'status'}>{gpsState === 'loading' && <LoaderCircle className="location-spinner" size={16} />}{gpsState === 'success' && <CheckCircle2 size={16} />}{gpsState === 'error' && <MapPin size={16} />}{gpsMessage}</div>}
         </article>
-
-        <article className={`location-option ${locationMode === 'search' ? 'is-active' : ''}`}>
-          <div className="location-option-heading"><span className="location-option-icon icon-search"><Search size={19} /></span><div><h2>Choose a location</h2><p>City, neighbourhood, or your usual spot.</p></div></div>
-          <label className="location-search"><Search size={16} /><input value={locationQuery} onFocus={onSearchFocus} onChange={(event) => onQueryChange(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && locationQuery.trim() && onSelectLocation(locationQuery.trim())} placeholder="Try a city or neighbourhood" aria-label="Search a city or neighbourhood" /></label>
-          {locationMode === 'search' && (
-            <div className="location-suggestions">
-              <span className="suggestion-label">SUGGESTED FOR THIS DEMO</span>
-              {matchingLocations.map((location) => <button key={location} className={selectedLocation === location ? 'suggestion-selected' : ''} onClick={() => onSelectLocation(location)}><MapPin size={14} />{location}{selectedLocation === location && <Check size={14} />}</button>)}
-              {locationQuery.trim() && !hasExactMatch && <button className="custom-location" onClick={() => onSelectLocation(locationQuery.trim())}><Search size={14} />Use “{locationQuery.trim()}”</button>}
-              {!matchingLocations.length && !locationQuery.trim() && <span className="suggestion-empty">Start typing to see suggestions.</span>}
-            </div>
-          )}
-          {locationMode === 'search' && selectedLocation && <div className="location-confirmation"><CheckCircle2 size={15} /> Selected: {selectedLocation}</div>}
+        <article className={`location-option ${locationMode === 'search' ? 'is-active' : ''} ${locationSource === 'manual' ? 'is-selected' : ''}`}>
+          <div className="location-option-heading"><span className="location-option-icon icon-search"><Search size={19} /></span><div><h2>Choose a location</h2><p>Search a city or neighbourhood.</p></div></div>
+          <label className="location-search"><Search size={16} /><input value={locationQuery} onFocus={onSearchFocus} onChange={(event) => { onQueryChange(event.target.value); }} onKeyDown={(event) => event.key === 'Enter' && onSearch()} placeholder="e.g. Ranelagh, Dublin" aria-label="Enter a city or neighbourhood" maxLength={100} /></label>
+          <p className="location-manual-help">Search results are real locations from OpenStreetMap. Choose a result to set the map centre.</p>
+          <button className="button button-secondary manual-location-button" onClick={onSearch} disabled={!locationQuery.trim() || locationSearchState === 'loading'}>{locationSearchState === 'loading' ? <LoaderCircle className="location-spinner" size={15} /> : <Search size={15} />}{locationSearchState === 'loading' ? 'Searching…' : 'Search locations'}</button>
+          {locationSearchMessage && <div className={`location-feedback ${locationSearchState === 'error' ? 'gps-error' : ''}`} role={locationSearchState === 'error' ? 'alert' : 'status'}>{locationSearchState === 'loading' && <LoaderCircle className="location-spinner" size={16} />}{locationSearchMessage}</div>}
+          {locationResults.length > 0 && <div className="location-result-list" aria-label="Location search results">{locationResults.map((result) => <button key={`${result.osmType}/${result.osmId}`} className="location-result" onClick={() => onSelectLocation(result)}><MapPin size={15} /><span>{result.name}</span><ChevronRight size={15} /></button>)}</div>}
         </article>
       </div>
-      <div className="location-bottom"><span><MapPin size={15} />{selectedLocation ? `Discovery area: ${selectedLocation}` : 'Choose either option to set your discovery area.'}</span><button className="button button-primary" onClick={onContinue} disabled={!selectedLocation}>Show us the group <ArrowRight size={18} /></button></div>
-      <div className="location-demo-note">DEMO LOCATION ONLY · NO GPS OR MAP SERVICE IS CONNECTED</div>
+      {selectedLocation && <div className="selected-location-banner"><MapPin size={17} /><span><small>SELECTED MEET-UP AREA</small><strong>{selectedLocation.name}</strong><em>{locationSource === 'current' ? 'Detected from your device location' : 'Selected from OpenStreetMap search results'}</em></span><CheckCircle2 size={19} /></div>}
+      <div className="location-bottom"><span><MapPin size={15} />{selectedLocation ? `Selected: ${selectedLocation.name}` : 'Choose a location to continue.'}</span><button className="button button-primary" onClick={onContinue} disabled={!selectedLocation}>Review your group <ArrowRight size={18} /></button></div>
+      <div className="geocoding-attribution">Geocoding by Nominatim · © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a></div>
     </section>
   );
 }
 
-function OverviewScreen({ groupName, userPicks, location, joinedMembers, activeMemberId, onContinue }: { groupName: string; userPicks: Picks; location: string; joinedMembers: GroupMember[]; activeMemberId: string; onContinue: () => void }) {
-  function preferenceValue(member: GroupMember, key: 'budget' | 'time' | 'mood' | 'categories' | 'distance' | 'location') {
-    if (member.id === activeMemberId && member.preferencesSubmitted) {
-      if (key === 'location') return location || 'Not shared yet';
-      return userPicks[key]?.join(', ') || 'Not shared yet';
-    }
-    return member[key] || 'Not shared yet';
-  }
-
+function OverviewScreen({ group, location, notice, onEdit, onContinue }: { group: GroupSession; location: string; notice: string; onEdit: (member: GroupMember) => void; onContinue: () => void }) {
   return (
     <section className="content-page overview-page">
-      <div className="overview-heading-row">
-        <ScreenHeading eyebrow="SAME CREW, DIFFERENT VIBES" accent="peach" title={<><span className="peach-text">{groupName}</span> lineup.</>} description="These are the people who joined this private group. Preferences appear as each member shares them." />
-      </div>
+      <div className="overview-heading-row"><ScreenHeading eyebrow="SAME CREW, DIFFERENT VIBES" accent="peach" title={<><span className="peach-text">{group.name}</span> lineup.</>} description="Everyone can review their answers before you find the group’s plan." /></div>
+      {notice && <div className="flow-notice" role="status"><CheckCircle2 size={17} />{notice}</div>}
+      <div className="one-device-note"><UsersRound size={15} /> A shared-device group of {group.participantCount} · Meet-up area: {location}</div>
       <div className="member-grid">
-        {joinedMembers.map((member, index) => (
-          <article className={`member-card member-${member.color}`} key={member.id} style={{ animationDelay: `${index * 100}ms` }}>
-            <div className="member-card-top"><div className={`member-avatar avatar-${member.color}`}>{member.initials}</div><span className="member-number">0{index + 1} / {String(joinedMembers.length).padStart(2, '0')}</span></div>
-            <h2>{member.name}</h2>
-            <p className="member-quote">{member.preferencesSubmitted ? 'Preferences shared with the group.' : 'Joined the group. Preferences not shared yet.'}</p>
-            <div className="member-tags"><span><Wallet size={13} />{preferenceValue(member, 'budget')}</span><span><Clock3 size={13} />{preferenceValue(member, 'time')}</span><span><Sparkles size={13} />{preferenceValue(member, 'mood')}</span><span><Heart size={13} />{preferenceValue(member, 'categories')}</span><span><MapPin size={13} />{preferenceValue(member, 'location')}</span><span><Navigation size={13} />{preferenceValue(member, 'distance')}</span></div>
-            <div className="member-card-bottom"><span>HAS A POINT</span><span className="member-doodle">{member.color === 'pink' ? '♥' : member.color === 'lime' ? '↗' : '✳'}</span></div>
-          </article>
-        ))}
+        {group.members.map((member, index) => <article className={`member-card member-${member.color}`} key={member.id} style={{ animationDelay: `${index * 100}ms` }}>
+          <div className="member-card-top"><div className={`member-avatar avatar-${member.color}`}>{member.initials}</div><span className="member-number">PERSON {index + 1} / {String(group.participantCount).padStart(2, '0')}</span></div>
+          <h2>{member.name}</h2><p className="member-quote">Preferences shared with the group.</p>
+          <div className="member-tags"><span><Wallet size={13} />{member.picks.budget.join(', ') || 'Any budget'}</span><span><Clock3 size={13} />{member.picks.time.join(', ') || 'Any time'}</span><span><Sparkles size={13} />{member.picks.mood.join(', ') || 'Any mood'}</span><span><Heart size={13} />{member.picks.categories.join(', ') || 'Any activity'}</span><span><Navigation size={13} />{member.picks.distance.join(', ') || 'Any distance'}</span></div>
+          <div className="member-card-bottom"><span>HAS A POINT</span><button className="member-edit-button" onClick={() => onEdit(member)}>Edit answers <ChevronRight size={14} /></button></div>
+        </article>)}
       </div>
-      <div className="group-insight"><div className="insight-icon"><UsersRound size={21} /></div><div><strong>Same group, different priorities.</strong><span>We’re balancing budgets, food and drink favorites, mood, time and a meet-up spot that works for everyone in this friend group.</span></div><span className="insight-spark">✳</span></div>
-      <div className="overview-actions"><span>THE GROUP CHAT HAS DONE ENOUGH.</span><button className="button button-primary" onClick={onContinue}>Find our Plan B <Sparkles size={17} /></button></div>
+      <div className="group-insight"><div className="insight-icon"><UsersRound size={21} /></div><div><strong>Different plans. One good choice.</strong><span>Recommendations use real place categories and coordinates. OpenStreetMap often lacks prices, hours, duration and vibe, so we never guess those details.</span></div><span className="insight-spark">✳</span></div>
+      <div className="overview-actions"><span>READY WHEN YOUR WHOLE CREW IS.</span><button className="button button-primary" onClick={onContinue}>Find our perfect plan <Sparkles size={17} /></button></div>
     </section>
   );
 }
 
-function RecommendationsScreen({ location, saved, onToggleSaved }: { location: string; saved: string[]; onToggleSaved: (venue: Venue) => void }) {
-  const [activeVenue, setActiveVenue] = useState(venues[0].id);
-
-  return (
-    <section className="content-page recommendations-page">
-      <div className="recommendation-heading-row">
-        <ScreenHeading eyebrow="DRUMROLL, PLEASE" accent="lime" title={<>Your kind of <span className="lime-text">place.</span></>} description={`Fictional local spots around ${location || 'your chosen area'}, matched to your friend group.`} />
-        <div className="match-stamp"><Sparkles size={16} /><span>MADE FOR<br />YOUR GROUP</span></div>
-      </div>
-      <div className="demo-disclaimer">DEMO VENUES · Names, imagery, distances and hours are fictional examples.</div>
-      <div className="best-match-note"><span className="best-match-star">✳</span><div><strong>Why Olive & Ember is the best compromise</strong><span>It keeps the group within budget, offers a relaxed group-friendly menu, and sits close to your selected area. The scores below reflect your friend group’s shared preferences.</span></div></div>
-      <MockMap location={location} activeVenue={activeVenue} onSelectVenue={setActiveVenue} />
-      <div className="recommendation-list">
-        {venues.map((venue, index) => (
-          <VenueCard key={venue.id} venue={venue} rank={index + 1} active={activeVenue === venue.id} onActivate={() => setActiveVenue(venue.id)} saved={saved.includes(venue.id)} onToggleSaved={onToggleSaved} />
-        ))}
-      </div>
-      <div className="recommendation-footer"><span><span className="tiny-live-dot" /> FICTIONAL VENUES · DEMO HOURS · SAMPLE GROUP SCORES</span><button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>Back to top <ArrowRight size={14} /></button></div>
-    </section>
-  );
-}
-
-function MockMap({ location, activeVenue, onSelectVenue }: { location: string; activeVenue: string; onSelectVenue: (venueId: string) => void }) {
-  return (
-    <section className="mock-map-section" aria-label="Demonstration map showing three fictional venues">
-      <div className="mock-map-heading"><div><MapPin size={16} /><span>THE LOCAL LOWDOWN</span></div><span>{location.toUpperCase()} · DEMO MAP</span></div>
-      <div className="mock-map">
-        <div className="map-road map-road-one" /><div className="map-road map-road-two" /><div className="map-road map-road-three" /><div className="map-road map-road-four" />
-        <div className="map-park"><span>THE LITTLE<br />GREEN BIT</span></div>
-        <span className="map-district map-district-one">LITTLE STREETS</span><span className="map-district map-district-two">THE BUSY BIT</span>
-        {venues.map((venue, index) => (
-          <button key={venue.id} className={`map-pin map-pin-${index + 1} ${activeVenue === venue.id ? 'pin-active' : ''}`} onClick={() => onSelectVenue(venue.id)} aria-label={`View ${venue.name} on map`} aria-pressed={activeVenue === venue.id}>
-            <span>{index + 1}</span><i />
-          </button>
-        ))}
-        <span className="map-compass">N<br /><ArrowRight size={13} /></span>
-        <div className="map-label">DEMO MAP · NOT TO SCALE</div>
-      </div>
-      <div className="map-legend">{venues.map((venue, index) => <button key={venue.id} className={activeVenue === venue.id ? 'legend-active' : ''} onClick={() => onSelectVenue(venue.id)}><span className={`legend-number legend-${index + 1}`}>{index + 1}</span>{venue.name}<span className="legend-category">{venue.category}</span></button>)}</div>
-    </section>
-  );
-}
-
-function VenueCard({
-  venue,
-  rank,
-  active,
-  onActivate,
-  saved,
-  onToggleSaved,
-}: {
-  venue: Venue;
-  rank: number;
-  active: boolean;
-  onActivate: () => void;
-  saved: boolean;
-  onToggleSaved: (venue: Venue) => void;
+function RecommendationsScreen({ location, places, allPlaceCount, categoryFilter, loading, error, saved, activePlaceId, onCategoryFilterChange, onSelectPlace, onToggleSaved, onRetry }: {
+  location: LocationSelection;
+  places: OpenStreetMapPlace[];
+  allPlaceCount: number;
+  categoryFilter: PlaceCategory | 'all';
+  loading: boolean;
+  error: string;
+  saved: string[];
+  activePlaceId: string;
+  onCategoryFilterChange: (category: PlaceCategory | 'all') => void;
+  onSelectPlace: (placeId: string) => void;
+  onToggleSaved: (place: OpenStreetMapPlace) => void;
+  onRetry: () => void;
 }) {
   return (
-    <article className={`activity-card activity-${venue.color} ${rank === 1 ? 'activity-featured' : ''} ${active ? 'venue-active' : ''}`} onClick={onActivate}>
-      <div className="activity-image-wrap">
-        <img className="activity-image" src={venue.image} alt={venue.imageAlt} loading={rank === 1 ? 'eager' : 'lazy'} />
-        <div className="image-overlay" />
-        {venue.badge && <span className="activity-badge"><Sparkles size={13} /> {venue.badge}</span>}
-        <span className="activity-rank">0{rank}</span>
-        <div className="compatibility-badge"><span>GROUP<br />MATCH</span><strong>{venue.compatibility}<small>%</small></strong></div>
+    <section className="content-page recommendations-page">
+      <div className="recommendation-heading-row"><ScreenHeading eyebrow="DRUMROLL, PLEASE" accent="lime" title={<>Your kind of <span className="lime-text">place.</span></>} description={`Real OpenStreetMap listings near ${location.name}. Place details depend on what has been mapped.`} /><div className="match-stamp"><MapPin size={16} /><span>REAL<br />PLACES</span></div></div>
+      <div className="real-data-note"><span className="best-match-star">✳</span><div><strong>How these recommendations work</strong><span>We prioritize places matching the most participants’ selected interests and distances. Prices, hours, duration and mood are not consistently available in OpenStreetMap, so we never infer them.</span></div></div>
+      <div className="category-filters" aria-label="Filter places by category">
+        <button className={categoryFilter === 'all' ? 'is-active' : ''} onClick={() => onCategoryFilterChange('all')} aria-pressed={categoryFilter === 'all'}>All places</button>
+        {placeCategories.map(({ id, label }) => <button key={id} className={categoryFilter === id ? 'is-active' : ''} onClick={() => onCategoryFilterChange(id)} aria-pressed={categoryFilter === id}>{label}</button>)}
+      </div>
+      {loading && <div className="places-feedback" role="status"><LoaderCircle className="location-spinner" size={20} />Searching OpenStreetMap for nearby places…</div>}
+      {error && <div className="places-feedback places-error" role="alert"><span>{error}</span><button className="button button-secondary" onClick={onRetry}>Try again</button></div>}
+      {!loading && !error && allPlaceCount === 0 && <div className="places-feedback" role="status"><MapPin size={20} />No mapped places were found within 5 km of this location. Try another location or search again later.</div>}
+      {!loading && !error && allPlaceCount > 0 && places.length === 0 && <div className="places-feedback" role="status">No nearby places match this category filter. Choose another category to see more results.</div>}
+      {allPlaceCount > 0 && <RealPlacesMap location={location} places={places} activePlaceId={activePlaceId} onSelectPlace={onSelectPlace} />}
+      <div className="recommendation-list">{places.map((place, index) => <PlaceCard key={place.id} place={place} rank={index + 1} active={activePlaceId === place.id} saved={saved.includes(place.id)} onActivate={() => onSelectPlace(place.id)} onToggleSaved={onToggleSaved} />)}</div>
+      <div className="recommendation-footer"><span><span className="tiny-live-dot" /> REAL PLACE DATA · © OPENSTREETMAP CONTRIBUTORS</span><button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>Back to top <ArrowRight size={14} /></button></div>
+    </section>
+  );
+}
+
+function RealPlacesMap({ location, places, activePlaceId, onSelectPlace }: {
+  location: LocationSelection; places: OpenStreetMapPlace[]; activePlaceId: string; onSelectPlace: (placeId: string) => void;
+}) {
+  const [tileError, setTileError] = useState(false);
+  return (
+    <section className="real-map-section" aria-label={`Interactive map of real OpenStreetMap places near ${location.name}`}>
+      <div className="real-map-heading"><div><MapPin size={16} /><span>REAL OPENSTREETMAP PLACES</span></div><span>{location.name}</span></div>
+      <MapContainer key={`${location.lat},${location.lon}`} center={[location.lat, location.lon]} zoom={14} scrollWheelZoom={false} className="real-map">
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          eventHandlers={{ tileerror: () => setTileError(true) }}
+        />
+        <MapFocus places={places} activePlaceId={activePlaceId} />
+        {places.map((place) => <Marker
+          key={place.id}
+          position={[place.lat, place.lon]}
+          icon={placeMarkerIcon}
+          eventHandlers={{ click: () => onSelectPlace(place.id) }}
+        >
+          <Popup>
+            <strong>{place.name}</strong><br />
+            {placeCategoryLabel(place.category)} · {place.address}
+            <br /><a href={openStreetMapElementUrl(place)} target="_blank" rel="noreferrer">View OpenStreetMap listing</a>
+          </Popup>
+        </Marker>)}
+      </MapContainer>
+      {tileError && <p className="map-tile-error" role="status">Map tiles could not be loaded. The nearby listings are still available below.</p>}
+    </section>
+  );
+}
+
+function MapFocus({ places, activePlaceId }: { places: OpenStreetMapPlace[]; activePlaceId: string }) {
+  const map = useMap();
+  useEffect(() => {
+    const activePlace = places.find((place) => place.id === activePlaceId);
+    if (activePlace) map.panTo([activePlace.lat, activePlace.lon]);
+  }, [activePlaceId, map, places]);
+  return null;
+}
+
+function placeCategoryLabel(category: PlaceCategory) {
+  return placeCategories.find((item) => item.id === category)?.label ?? 'Place';
+}
+
+function placeCategoryIcon(category: PlaceCategory) {
+  if (category === 'cafe') return <Coffee size={16} />;
+  if (category === 'restaurant') return <Utensils size={16} />;
+  if (category === 'bar') return <Wine size={16} />;
+  return <Activity size={16} />;
+}
+
+function openStreetMapElementUrl(place: OpenStreetMapPlace) {
+  return `https://www.openstreetmap.org/${place.osmType}/${place.osmId}`;
+}
+
+function PlaceCard({ place, rank, active, saved, onActivate, onToggleSaved }: {
+  place: OpenStreetMapPlace; rank: number; active: boolean; saved: boolean; onActivate: () => void; onToggleSaved: (place: OpenStreetMapPlace) => void;
+}) {
+  const interestReason = place.interestParticipantCount
+    ? `Interest match for ${place.interestMatchCount} of ${place.interestParticipantCount} participants who selected an activity.`
+    : 'No activity interests were selected.';
+  const budgetReason = place.budgetParticipantCount
+    ? `${place.knownBudgetMatchCount} of ${place.budgetParticipantCount} participants with comparable mapped cost data fit their budget; cost basis may vary.`
+    : 'No comparable cost data is available for this listing.';
+  const distanceReason = place.distanceParticipantCount
+    ? `Distance fits ${place.distanceMatchCount} of ${place.distanceParticipantCount} distance preferences.`
+    : 'No distance preference was selected.';
+  return (
+    <article className={`activity-card real-place-card ${active ? 'venue-active' : ''}`}>
+      <div className={`activity-image-wrap place-art place-art-${place.category}`} aria-hidden="true">
+        <span className="place-art-icon">{placeCategoryIcon(place.category)}</span><span className="activity-rank">0{rank}</span>
       </div>
       <div className="activity-content">
-        <div className="activity-category">{venue.category === 'Cafe' && <Coffee size={12} />}{venue.category === 'Bar' && <Wine size={12} />}{venue.category} · FICTIONAL DEMO</div>
-        <div className="activity-title-row"><h2>{venue.name}</h2><button className={`save-button ${saved ? 'is-saved' : ''}`} onClick={(event) => { event.stopPropagation(); onToggleSaved(venue); }} aria-label={saved ? `Remove ${venue.name} from shortlist` : `Add ${venue.name} to shortlist`} aria-pressed={saved}>{saved ? <Check size={17} /> : <Plus size={18} />}</button></div>
-        <p className="activity-description">{venue.description}</p>
-        <div className="activity-meta"><span><Wallet size={15} />{venue.price}<small> / person</small></span><span><MapPin size={15} />{venue.distance}</span><span><Clock3 size={15} />{venue.travelTime}</span></div>
-        <div className="venue-hours"><Clock3 size={13} />{venue.openingHours}</div>
-        <div className="activity-reason"><span className="reason-spark">✳</span><p><strong>Why it works</strong>{venue.reason}</p></div>
-        <button className={`activity-cta ${saved ? 'cta-saved' : ''}`} onClick={(event) => { event.stopPropagation(); onToggleSaved(venue); }}>{saved ? 'In your shortlist' : rank === 1 ? 'This one feels right' : 'Add to shortlist'}{saved ? <Check size={15} /> : <ChevronRight size={16} />}</button>
+        <div className="activity-category">{placeCategoryIcon(place.category)}{placeCategoryLabel(place.category)} · OPENSTREETMAP</div>
+        <div className="activity-title-row"><h2>{place.name}</h2><button className={`save-button ${saved ? 'is-saved' : ''}`} onClick={() => onToggleSaved(place)} aria-label={saved ? `Remove ${place.name} from shortlist` : `Add ${place.name} to shortlist`} aria-pressed={saved}>{saved ? <Check size={17} /> : <Plus size={18} />}</button></div>
+        <p className="activity-description">{place.description}</p>
+        <div className="activity-meta">
+          <span><MapPin size={15} />{place.address}<small> address</small></span>
+          <span><Wallet size={15} />{place.cost}<small> cost</small></span>
+          <span><Clock3 size={15} />{place.openingHours}<small> hours</small></span>
+          <span>{Math.round(place.distanceKm * 100) / 100} km<small> straight-line distance</small></span>
+        </div>
+        <div className="activity-reason"><span className="reason-spark">✳</span><p><strong>Group match</strong>{interestReason} {budgetReason} {distanceReason}</p></div>
+        <div className="place-extra-details"><span><strong>Cuisine:</strong> {place.cuisine}</span><span><strong>Phone:</strong> {place.phone}</span><span><strong>Website:</strong> {place.website}</span></div>
+        <div className="place-card-actions"><button className="activity-cta" onClick={onActivate}>Show on map <MapPin size={15} /></button><a className="osm-place-link" href={openStreetMapElementUrl(place)} target="_blank" rel="noreferrer">Open OpenStreetMap listing <ArrowRight size={14} /></a></div>
       </div>
     </article>
   );
