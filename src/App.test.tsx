@@ -66,15 +66,28 @@ describe('Plan B shared-device group journey', () => {
     expect(screen.queryByRole('button', { name: /join a group|invite friends|share invitation/i })).toBeNull();
     expect(window.localStorage.getItem('planb-session-v2')).toContain('"participantCount":2');
 
-    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    let overpassRequestCount = 0;
+    let resolvePrimaryRequest: ((response: Response) => void) | undefined;
+    const primaryRequest = new Promise<Response>((resolve) => {
+      resolvePrimaryRequest = resolve;
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL, _init?: RequestInit) => {
       const isSearch = String(input).includes('nominatim.openstreetmap.org');
-      const payload = isSearch ? [{
-        display_name: 'My neighbourhood, Galway, Ireland',
-        lat: '53.27',
-        lon: '-9.05',
-        osm_type: 'relation',
-        osm_id: 1337,
-      }] : {
+      if (isSearch) {
+        return Promise.resolve(new Response(JSON.stringify([{
+          display_name: 'My neighbourhood, Galway, Ireland',
+          lat: '53.27',
+          lon: '-9.05',
+          osm_type: 'relation',
+          osm_id: 1337,
+        }]), { status: 200, headers: { 'content-type': 'application/json' } }));
+      }
+
+      overpassRequestCount += 1;
+      if (overpassRequestCount === 1) {
+        return primaryRequest;
+      }
+      const payload = {
         elements: [
           { type: 'node', id: 101, lat: 53.271, lon: -9.05, tags: { name: 'Real Roast Cafe', amenity: 'cafe', cuisine: 'coffee_shop' } },
           { type: 'way', id: 202, center: { lat: 53.272, lon: -9.051 }, tags: { name: 'Market Table', amenity: 'restaurant', 'addr:full': '5 Market Street' } },
@@ -108,6 +121,8 @@ describe('Plan B shared-device group journey', () => {
     expect(screen.getByRole('status').textContent).toContain("Riley's answers have been updated");
     expect(within(screen.getAllByRole('article')[1]).getByText(/Coffee/)).toBeTruthy();
     await user.click(screen.getByRole('button', { name: /find our perfect plan/i }));
+    expect(await screen.findByText(/Searching OpenStreetMap for nearby places/i)).toBeTruthy();
+    resolvePrimaryRequest?.(new Response('<html><title>Not acceptable</title></html>', { status: 406 }));
 
     expect(await screen.findByRole('heading', { name: 'Real Roast Cafe' })).toBeTruthy();
     expect(screen.getByRole('heading', { name: 'Market Table' })).toBeTruthy();
@@ -115,8 +130,14 @@ describe('Plan B shared-device group journey', () => {
     expect(screen.getAllByText('Not available').length).toBeGreaterThan(0);
     expect(screen.getByRole('region', { name: /interactive map of real OpenStreetMap places/i })).toBeTruthy();
     expect(screen.getAllByRole('link', { name: /Open OpenStreetMap listing/i })).toHaveLength(2);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(String(fetchMock.mock.calls[1][0])).toContain('overpass-api.de/api/interpreter');
+    expect(String(fetchMock.mock.calls[2][0])).toContain('overpass.kumi.systems/api/interpreter');
+    expect(fetchMock.mock.calls[2][1]?.method).toBe('POST');
+    const overpassBody = new URLSearchParams(String(fetchMock.mock.calls[2][1]?.body));
+    const overpassQuery = overpassBody.get('data') ?? '';
+    expect(overpassQuery).toContain('around:5000,53.27,-9.05');
+    expect(overpassQuery).toContain('["amenity"');
     await user.click(screen.getByRole('button', { name: 'Restaurants' }));
     expect(screen.queryByRole('heading', { name: 'Real Roast Cafe' })).toBeNull();
     expect(screen.getByRole('heading', { name: 'Market Table' })).toBeTruthy();

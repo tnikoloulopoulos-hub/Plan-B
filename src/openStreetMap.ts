@@ -75,6 +75,19 @@ const nominatimCache = new Map<string, unknown>();
 let nextNominatimRequestAt = 0;
 let nominatimRequestQueue: Promise<void> = Promise.resolve();
 const nearbyRadiusMeters = 5000;
+const overpassEndpoints = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+];
+const overpassRequestTimeoutMs = 18000;
+
+class OverpassQueryError extends Error {
+  constructor(status: number) {
+    super(`The Overpass places query was rejected (HTTP ${status}). Please try again later.`);
+    this.name = 'OverpassQueryError';
+  }
+}
 
 function coordinateKey(lat: number, lon: number) {
   return `${lat.toFixed(4)},${lon.toFixed(4)}`;
@@ -412,19 +425,20 @@ export async function fetchNearbyPlaces(lat: number, lon: number): Promise<OpenS
   if (cached) return cached;
 
   const query = [
-    '[out:json][timeout:25];',
+    '[out:json][timeout:15];',
     '(',
     `nwr["amenity"~"^(cafe|restaurant|fast_food|food_court|ice_cream|bar|pub|biergarten|cinema|theatre|nightclub|arts_centre|community_centre|events_venue|marketplace)$"](around:${nearbyRadiusMeters},${lat},${lon});`,
     `nwr["leisure"~"^(park|garden|sports_centre|swimming_pool|fitness_centre|bowling_alley|escape_game)$"](around:${nearbyRadiusMeters},${lat},${lon});`,
     `nwr["tourism"~"^(museum|gallery|attraction|zoo|aquarium)$"](around:${nearbyRadiusMeters},${lat},${lon});`,
     ');out center tags 300;',
   ].join('');
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 30000);
-  try {
-    let response: Response;
+
+  const failures: { kind: 'timeout' | 'network' | 'rate-limit' | 'http' | 'response'; status?: number }[] = [];
+  for (const endpoint of overpassEndpoints) {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), overpassRequestTimeoutMs);
     try {
-      response = await fetch('https://overpass-api.de/api/interpreter', {
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
           Accept: 'application/json',
@@ -433,26 +447,55 @@ export async function fetchNearbyPlaces(lat: number, lon: number): Promise<OpenS
         body: new URLSearchParams({ data: query }),
         signal: controller.signal,
       });
-    } catch (error) {
-      if (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError')) {
-        throw new Error('The places search took too long. Try again or choose a nearby area.');
+
+      if (!response.ok) {
+        const kind = response.status === 429 ? 'rate-limit' : 'http';
+        failures.push({ kind, status: response.status });
+        console.warn(`Overpass endpoint ${endpoint} returned HTTP ${response.status}.`);
+        if (response.status === 400 || response.status === 422) {
+          throw new OverpassQueryError(response.status);
+        }
+        continue;
       }
-      throw new Error('Nearby places could not be loaded. Check your connection and try again.');
-    }
-    if (response.status === 429) throw new Error('The OpenStreetMap places service is busy. Please wait a moment and try again.');
-    if (!response.ok) throw new Error('The places service is temporarily unavailable. Try again shortly.');
-    let places: OpenStreetMapPlace[];
-    try {
-      places = parseOverpassPlaces(await response.json());
+      try {
+        const places = parseOverpassPlaces(await response.json());
+        nearbyPlacesCache.set(cacheKey, places);
+        return places;
+      } catch {
+        failures.push({ kind: 'response' });
+        console.warn(`Overpass endpoint ${endpoint} returned an invalid or incomplete response.`);
+      }
     } catch (error) {
-      if (error instanceof Error && /invalid response|could not complete/i.test(error.message)) throw error;
-      throw new Error('The places service returned incomplete data. Try searching again shortly.');
+      if (error instanceof OverpassQueryError) throw error;
+      const timedOut = error instanceof Error && /AbortError|TimeoutError/.test(error.name);
+      failures.push({ kind: timedOut ? 'timeout' : 'network' });
+      console.warn(`Overpass endpoint ${endpoint} could not complete the request.`, error);
+    } finally {
+      window.clearTimeout(timeoutId);
     }
-    nearbyPlacesCache.set(cacheKey, places);
-    return places;
-  } catch (error) {
-    throw error;
-  } finally {
-    window.clearTimeout(timeoutId);
   }
+
+  if (failures.length > 0 && failures.every((failure) => failure.kind === 'rate-limit')) {
+    throw new Error('The OpenStreetMap places services are busy. Please wait a moment and try again.');
+  }
+  if (failures.length > 0 && failures.every((failure) => failure.kind === 'timeout')) {
+    throw new Error('The nearby places search timed out on available OpenStreetMap services. Try again shortly.');
+  }
+  if (failures.length > 0 && failures.every((failure) => failure.kind === 'network')) {
+    throw new Error('Nearby places services could not be reached. Check your connection or try again.');
+  }
+  const statuses = [...new Set(failures.flatMap((failure) => failure.status === undefined ? [] : [failure.status]))];
+  if (statuses.length) {
+    throw new Error(`The places service is temporarily unavailable after trying all Overpass endpoints (HTTP ${statuses.join(', ')}). Try again shortly.`);
+  }
+  if (failures.some((failure) => failure.kind === 'timeout')) {
+    throw new Error('Nearby places services were slow or unavailable. Try again shortly.');
+  }
+  if (failures.some((failure) => failure.kind === 'response')) {
+    throw new Error('The places service returned incomplete data from all Overpass endpoints. Try searching again shortly.');
+  }
+  if (failures.some((failure) => failure.kind === 'rate-limit')) {
+    throw new Error('The OpenStreetMap places services are busy or unavailable. Please wait a moment and try again.');
+  }
+  throw new Error('The places service returned incomplete data from all Overpass endpoints. Try searching again shortly.');
 }
