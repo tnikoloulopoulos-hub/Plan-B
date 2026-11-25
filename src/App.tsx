@@ -31,13 +31,16 @@ import {
 } from './data';
 import {
   fetchNearbyPlaces,
+  geoapifyMapTileUrl,
+  isAthensCoordinate,
   rankPlaces,
-  reverseGeocodeLocation,
+  resolveSuggestedArea,
   searchLocations,
+  suggestedAthensAreas,
+  type GeoapifyPlace,
   type LocationSearchResult,
   type LocationSelection,
-  type OpenStreetMapPlace,
-} from './openStreetMap';
+} from './geoapify';
 
 type Screen = 'welcome' | 'group' | 'turn' | 'preferences' | 'location' | 'overview' | 'recommendations';
 type PreferenceKey = PreferenceGroup['key'];
@@ -94,7 +97,8 @@ function readSavedSession(): GroupSession | null {
         !('name' in location) || typeof location.name !== 'string' ||
         !('lat' in location) || typeof location.lat !== 'number' ||
         !('lon' in location) || typeof location.lon !== 'number' ||
-        !('source' in location) || (location.source !== 'current' && location.source !== 'manual')
+        !('source' in location) || location.source !== 'manual' ||
+        !isAthensCoordinate(location.lat, location.lon)
       ) {
         return { ...session, selectedLocation: null };
       }
@@ -144,16 +148,12 @@ function App() {
     return initialSession?.members.find((member) => !member.preferencesSubmitted)?.picks ?? { ...emptyPicks };
   });
   const [selectedLocation, setSelectedLocation] = useState<LocationSelection | null>(() => initialSession?.selectedLocation ?? null);
-  const locationSource = selectedLocation?.source ?? null;
   const [locationQuery, setLocationQuery] = useState(() => initialSession?.selectedLocation?.source === 'manual' ? initialSession.selectedLocation.name : '');
   const [locationSearchState, setLocationSearchState] = useState<'idle' | 'loading' | 'error' | 'empty'>('idle');
   const [locationSearchMessage, setLocationSearchMessage] = useState('');
   const [locationResults, setLocationResults] = useState<LocationSearchResult[]>([]);
-  const [locationMode, setLocationMode] = useState<'current' | 'search' | null>(() => initialSession?.selectedLocation?.source === 'current' ? 'current' : initialSession?.selectedLocation ? 'search' : null);
-  const [gpsState, setGpsState] = useState<'idle' | 'loading' | 'error' | 'success'>(() => initialSession?.selectedLocation?.source === 'current' ? 'success' : 'idle');
-  const [gpsMessage, setGpsMessage] = useState(() => initialSession?.selectedLocation?.source === 'current' ? `Current area selected: ${initialSession.selectedLocation.name}` : '');
   const locationRequestId = useRef(0);
-  const [places, setPlaces] = useState<OpenStreetMapPlace[]>([]);
+  const [places, setPlaces] = useState<GeoapifyPlace[]>([]);
   const [placesLoading, setPlacesLoading] = useState(false);
   const [placesError, setPlacesError] = useState('');
   const [placeCategoryFilter, setPlaceCategoryFilter] = useState<PlaceCategory | 'all'>('all');
@@ -174,11 +174,13 @@ function App() {
 
   const activeMember = session?.members.find((member) => member.id === activeMemberId);
   const currentPreference = preferenceGroups[preferenceIndex];
-  const rankedPlaces = rankPlaces(
-    places,
-    session?.members.filter((member) => member.preferencesSubmitted).map((member) => member.picks) ?? [],
-    selectedLocation ?? undefined,
-  );
+  const rankedPlaces = selectedLocation
+    ? rankPlaces(
+      places,
+      session?.members.filter((member) => member.preferencesSubmitted).map((member) => member.picks) ?? [],
+      selectedLocation,
+    )
+    : places;
   const filteredPlaces = placeCategoryFilter === 'all'
     ? rankedPlaces
     : rankedPlaces.filter((place) => place.category === placeCategoryFilter);
@@ -201,9 +203,6 @@ function App() {
     setLocationResults([]);
     setLocationSearchState('idle');
     setLocationSearchMessage('');
-    setLocationMode(null);
-    setGpsState('idle');
-    setGpsMessage('');
     setPlaces([]);
     setPlacesError('');
     setPlacesLoading(false);
@@ -277,38 +276,41 @@ function App() {
   }
 
   function saveLocation(location: LocationSelection) {
-    if (!location.name.trim() || !Number.isFinite(location.lat) || !Number.isFinite(location.lon)) return;
+    if (!location.name.trim() || !isAthensCoordinate(location.lat, location.lon)) {
+      setLocationSearchState('error');
+      setLocationSearchMessage('Select a valid Geoapify result within Athens, Greece.');
+      return;
+    }
     locationRequestId.current += 1;
     setSelectedLocation(location);
     setSession((current) => current ? { ...current, selectedLocation: location } : current);
-    setLocationMode(location.source === 'current' ? 'current' : 'search');
-    setLocationQuery(location.source === 'manual' ? location.name : '');
+    setLocationQuery(location.name);
     setLocationResults([]);
     setLocationSearchState('idle');
     setLocationSearchMessage('');
-    if (location.source === 'manual') {
-      setGpsState('idle');
-      setGpsMessage('');
-    }
   }
 
   function updateLocationQuery(query: string) {
     locationRequestId.current += 1;
     setLocationQuery(query);
+    setSelectedLocation(null);
+    setSession((current) => current ? { ...current, selectedLocation: null } : current);
     setLocationResults([]);
     setLocationSearchState('idle');
     setLocationSearchMessage('');
   }
 
-  async function searchForLocation() {
-    const query = locationQuery.trim();
+  async function searchForLocation(searchText = locationQuery) {
+    const query = searchText.trim();
     if (!query) {
       setLocationSearchState('error');
-      setLocationSearchMessage('Enter a city or neighbourhood to search.');
+      setLocationSearchMessage('Enter an Athens neighbourhood or area to search.');
       return;
     }
     const requestId = ++locationRequestId.current;
-    setLocationMode('search');
+    setLocationQuery(query);
+    setSelectedLocation(null);
+    setSession((current) => current ? { ...current, selectedLocation: null } : current);
     setLocationSearchState('loading');
     setLocationSearchMessage('');
     setLocationResults([]);
@@ -317,7 +319,7 @@ function App() {
       if (requestId !== locationRequestId.current) return;
       setLocationResults(results);
       setLocationSearchState(results.length ? 'idle' : 'empty');
-      setLocationSearchMessage(results.length ? '' : 'No matching places found. Try a nearby city or a more specific name.');
+      setLocationSearchMessage(results.length ? '' : 'No matching area found in Athens, Greece. Try another Athens neighbourhood.');
     } catch (error) {
       if (requestId !== locationRequestId.current) return;
       console.error('Could not search for a location.', error);
@@ -328,71 +330,29 @@ function App() {
     }
   }
 
-  function useCurrentLocation() {
+  async function selectSuggestedArea(area: string) {
     const requestId = ++locationRequestId.current;
-    setLocationMode('current');
-    setGpsState('loading');
-    setGpsMessage('Waiting for your browser’s location permission…');
-    setLocationSearchState('idle');
+    setLocationQuery(area);
+    setSelectedLocation(null);
+    setSession((current) => current ? { ...current, selectedLocation: null } : current);
+    setLocationResults([]);
+    setLocationSearchState('loading');
     setLocationSearchMessage('');
-    if (!navigator.geolocation) {
-      setGpsState('error');
-      setGpsMessage('Location is not available in this browser. Enter a city or neighbourhood instead.');
-      return;
-    }
-
     try {
-      navigator.geolocation.getCurrentPosition(async ({ coords }) => {
-        if (requestId !== locationRequestId.current) return;
-        setGpsMessage('Location found. Looking up your area…');
-        try {
-          const placeName = await reverseGeocodeLocation(coords.latitude, coords.longitude);
-          if (requestId !== locationRequestId.current) return;
-          saveLocation({ name: placeName, lat: coords.latitude, lon: coords.longitude, source: 'current' });
-          setGpsState('success');
-          setGpsMessage(`Current area selected: ${placeName}`);
-        } catch (error) {
-          if (requestId !== locationRequestId.current) return;
-          console.error('Could not reverse-geocode the current location.', error);
-          setGpsState('error');
-          setGpsMessage(error instanceof Error && !error.message.includes('Failed to fetch')
-            ? error.message
-            : 'We found your location, but could not look up its area. Enter a city or neighbourhood instead.');
-        }
-      }, (error) => {
-        if (requestId !== locationRequestId.current) return;
-        setGpsState('error');
-        if (error.code === error.PERMISSION_DENIED) {
-          setGpsMessage('Location permission was denied. Allow it in your browser settings or enter an area manually.');
-        } else if (error.code === error.POSITION_UNAVAILABLE) {
-          setGpsMessage('Your device could not determine a location. Enter an area manually or try again.');
-        } else if (error.code === error.TIMEOUT) {
-          setGpsMessage('The location request timed out. Try again or enter an area manually.');
-        } else {
-          setGpsMessage('We could not get your location. Enter an area manually or try again.');
-        }
-      }, { enableHighAccuracy: false, timeout: 12000, maximumAge: 60000 });
+      const result = await resolveSuggestedArea(area);
+      if (requestId !== locationRequestId.current) return;
+      saveLocation({ ...result, source: 'manual' });
     } catch (error) {
       if (requestId !== locationRequestId.current) return;
-      console.error('Could not start the browser location request.', error);
-      setGpsState('error');
-      setGpsMessage('Your browser could not start location detection. Enter an area manually or try again.');
+      console.error('Could not resolve a suggested Athens neighbourhood.', error);
+      setLocationSearchState('error');
+      setLocationSearchMessage(error instanceof Error
+        ? error.message
+        : 'The selected neighbourhood could not be verified. Try searching for it instead.');
     }
   }
 
-  function focusManualLocation() {
-    locationRequestId.current += 1;
-    setLocationMode('search');
-    setLocationResults([]);
-    setLocationSearchState('idle');
-    setLocationSearchMessage('');
-    if (gpsState === 'loading') {
-      setGpsState('idle');
-      setGpsMessage('');
-    }
-  }
-
-  function toggleSaved(place: OpenStreetMapPlace) {
+  function toggleSaved(place: GeoapifyPlace) {
     const isSaved = savedPlaces.includes(place.id);
     setSavedPlaces((current) => isSaved
       ? current.filter((id) => id !== place.id)
@@ -417,7 +377,7 @@ function App() {
       setActivePlaceId(results[0]?.id ?? '');
     } catch (error) {
       if (requestId !== recommendationRequestId.current) return;
-      console.error('Could not retrieve nearby OpenStreetMap places.', error);
+      console.error('Could not retrieve nearby Geoapify places.', error);
       setPlacesError(error instanceof Error && !error.message.includes('Failed to fetch')
         ? error.message
         : 'Nearby places could not be loaded. Check your connection and try again.');
@@ -466,7 +426,7 @@ function App() {
           <span className="brand-mark" aria-hidden="true"><span>B</span><ArrowDownLeft size={15} strokeWidth={3} /></span>
           <span className="brand-name">plan b<span>.</span></span>
         </button>
-        <div className="topbar-center"><span className="live-dot" /> One device. Everyone gets a turn.</div>
+        <div className="topbar-center"><span className="live-dot" /> Athens plans. One device. Everyone gets a turn.</div>
         {session && session.members.length > 0 && (
           <div className="avatar-stack" aria-label={`${session.members.length} participants`}>
             {session.members.map((member) => <span key={member.id} className={`mini-avatar mini-avatar-${member.color}`} title={member.name}>{member.initials}</span>)}
@@ -516,19 +476,14 @@ function App() {
         {screen === 'location' && (
           <LocationScreen
             selectedLocation={selectedLocation}
-            locationSource={locationSource}
             locationQuery={locationQuery}
             locationResults={locationResults}
             locationSearchState={locationSearchState}
             locationSearchMessage={locationSearchMessage}
-            locationMode={locationMode}
-            gpsState={gpsState}
-            gpsMessage={gpsMessage}
             notice={screenNotice}
-            onUseCurrent={useCurrentLocation}
-            onSearchFocus={focusManualLocation}
             onQueryChange={updateLocationQuery}
-            onSearch={searchForLocation}
+            onSearch={() => void searchForLocation()}
+            onSuggestedArea={(area) => void selectSuggestedArea(area)}
             onSelectLocation={(result) => saveLocation({ ...result, source: 'manual' })}
             onContinue={() => changeScreen('overview')}
           />
@@ -577,9 +532,9 @@ function WelcomeScreen({ onCreate }: { onCreate: () => void }) {
   return (
     <section className="welcome-layout">
       <div className="welcome-copy">
-        <div className="welcome-kicker"><span className="kicker-star">✳</span> GOOD PLANS, ZERO GROUP CHAT SPIRALS</div>
-        <h1>Different plans.<br />One <span>good choice.</span></h1>
-        <p className="welcome-description">Pass one phone around your crew. Everyone shares their vibe, then Plan B finds a plan that works for the group.</p>
+        <div className="welcome-kicker"><span className="kicker-star">✳</span> ATHENS, GREECE · GOOD PLANS, ZERO GROUP CHAT SPIRALS</div>
+        <h1>Plan B – Find your next plan in <span>Athens.</span></h1>
+        <p className="welcome-description">Discover places and activities in Athens that match your group's interests, budget and mood.</p>
         <div className="welcome-actions"><button className="button button-primary" onClick={onCreate}>Make a plan <ArrowRight size={18} /></button></div>
         <div className="welcome-proof"><UsersRound size={20} /><span>One shared device, with a private turn for everyone.</span></div>
       </div>
@@ -675,37 +630,34 @@ function PreferencesScreen({ preference, index, picks, participantName, particip
   );
 }
 
-function LocationScreen({ selectedLocation, locationSource, locationQuery, locationResults, locationSearchState, locationSearchMessage, locationMode, gpsState, gpsMessage, notice, onUseCurrent, onSearchFocus, onQueryChange, onSearch, onSelectLocation, onContinue }: {
-  selectedLocation: LocationSelection | null; locationSource: 'current' | 'manual' | null; locationQuery: string;
+function LocationScreen({ selectedLocation, locationQuery, locationResults, locationSearchState, locationSearchMessage, notice, onQueryChange, onSearch, onSuggestedArea, onSelectLocation, onContinue }: {
+  selectedLocation: LocationSelection | null; locationQuery: string;
   locationResults: LocationSearchResult[]; locationSearchState: 'idle' | 'loading' | 'error' | 'empty'; locationSearchMessage: string;
-  locationMode: 'current' | 'search' | null; gpsState: 'idle' | 'loading' | 'error' | 'success'; gpsMessage: string; notice: string;
-  onUseCurrent: () => void; onSearchFocus: () => void; onQueryChange: (query: string) => void; onSearch: () => void;
+  notice: string;
+  onQueryChange: (query: string) => void; onSearch: () => void; onSuggestedArea: (area: string) => void;
   onSelectLocation: (location: LocationSearchResult) => void; onContinue: () => void;
 }) {
   return (
     <section className="content-page location-page">
-      <ScreenHeading eyebrow="PICK YOUR PATCH" accent="purple" title={<>Where’s the <span className="purple-text">meet-up?</span></>} description="Choose a real area for your group. Use your device location or search OpenStreetMap by city or neighbourhood." />
+      <ScreenHeading eyebrow="ATHENS, GREECE" accent="purple" title={<>Where’s the <span className="purple-text">meet-up?</span></>} description="Search for an Athens neighbourhood, then select a real Geoapify result to set your meeting point." />
       {notice && <div className="flow-notice" role="status"><CheckCircle2 size={17} />{notice}</div>}
       <div className="one-device-note location-device-note"><UsersRound size={15} /> All participants use this device. No invites or cross-device syncing.</div>
-      <div className="location-options">
-        <article className={`location-option ${locationMode === 'current' ? 'is-active' : ''} ${locationSource === 'current' ? 'is-selected' : ''}`}>
-          <div className="location-option-heading"><span className="location-option-icon icon-current"><Navigation size={19} /></span><div><h2>Use my current location</h2><p>Quick, easy, no pin-dropping.</p></div></div>
-          <button className="location-action" onClick={onUseCurrent} disabled={gpsState === 'loading'}>{gpsState === 'loading' ? <LoaderCircle className="location-spinner" size={16} /> : <MapPin size={16} />} {gpsState === 'loading' ? 'Finding your location…' : 'Use my current location'} <ChevronRight size={16} /></button>
-          <p className="location-privacy-note">Your browser will ask permission. Coordinates are sent to Nominatim to find a place name.</p>
-          {gpsMessage && <div className={`location-feedback gps-${gpsState}`} role={gpsState === 'error' ? 'alert' : 'status'}>{gpsState === 'loading' && <LoaderCircle className="location-spinner" size={16} />}{gpsState === 'success' && <CheckCircle2 size={16} />}{gpsState === 'error' && <MapPin size={16} />}{gpsMessage}</div>}
-        </article>
-        <article className={`location-option ${locationMode === 'search' ? 'is-active' : ''} ${locationSource === 'manual' ? 'is-selected' : ''}`}>
-          <div className="location-option-heading"><span className="location-option-icon icon-search"><Search size={19} /></span><div><h2>Choose a location</h2><p>Search a city or neighbourhood.</p></div></div>
-          <label className="location-search"><Search size={16} /><input value={locationQuery} onFocus={onSearchFocus} onChange={(event) => { onQueryChange(event.target.value); }} onKeyDown={(event) => event.key === 'Enter' && onSearch()} placeholder="e.g. Ranelagh, Dublin" aria-label="Enter a city or neighbourhood" maxLength={100} /></label>
-          <p className="location-manual-help">Search results are real locations from OpenStreetMap. Choose a result to set the map centre.</p>
-          <button className="button button-secondary manual-location-button" onClick={onSearch} disabled={!locationQuery.trim() || locationSearchState === 'loading'}>{locationSearchState === 'loading' ? <LoaderCircle className="location-spinner" size={15} /> : <Search size={15} />}{locationSearchState === 'loading' ? 'Searching…' : 'Search locations'}</button>
+      <div className="location-options athens-location-options">
+        <article className={`location-option ${selectedLocation ? 'is-selected' : ''}`}>
+          <div className="location-option-heading"><span className="location-option-icon icon-search"><Search size={19} /></span><div><h2>Choose an Athens area</h2><p>Search any neighbourhood in Athens, Greece.</p></div></div>
+          <label className="location-search"><Search size={16} /><input value={locationQuery} onChange={(event) => onQueryChange(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && onSearch()} placeholder="e.g. Pangrati" aria-label="Search an Athens neighbourhood" maxLength={100} /></label>
+          <p className="location-manual-help">Choose a suggested neighbourhood for its central point, or search for a custom Athens area and select a result.</p>
+          <div className="athens-suggestions" aria-label="Suggested Athens neighbourhoods">
+            {suggestedAthensAreas.map((area) => <button key={area} type="button" onClick={() => onSuggestedArea(area)} disabled={locationSearchState === 'loading'}>{area}</button>)}
+          </div>
+          <button className="button button-secondary manual-location-button" onClick={onSearch} disabled={!locationQuery.trim() || locationSearchState === 'loading'}>{locationSearchState === 'loading' ? <LoaderCircle className="location-spinner" size={15} /> : <Search size={15} />}{locationSearchState === 'loading' ? 'Searching…' : 'Search Athens areas'}</button>
           {locationSearchMessage && <div className={`location-feedback ${locationSearchState === 'error' ? 'gps-error' : ''}`} role={locationSearchState === 'error' ? 'alert' : 'status'}>{locationSearchState === 'loading' && <LoaderCircle className="location-spinner" size={16} />}{locationSearchMessage}</div>}
-          {locationResults.length > 0 && <div className="location-result-list" aria-label="Location search results">{locationResults.map((result) => <button key={`${result.osmType}/${result.osmId}`} className="location-result" onClick={() => onSelectLocation(result)}><MapPin size={15} /><span>{result.name}</span><ChevronRight size={15} /></button>)}</div>}
+          {locationResults.length > 0 && <div className="location-result-list" aria-label="Athens location results">{locationResults.map((result) => <button key={result.id} className="location-result" onClick={() => onSelectLocation(result)}><MapPin size={15} /><span>{result.name}</span><ChevronRight size={15} /></button>)}</div>}
         </article>
       </div>
-      {selectedLocation && <div className="selected-location-banner"><MapPin size={17} /><span><small>SELECTED MEET-UP AREA</small><strong>{selectedLocation.name}</strong><em>{locationSource === 'current' ? 'Detected from your device location' : 'Selected from OpenStreetMap search results'}</em></span><CheckCircle2 size={19} /></div>}
+      {selectedLocation && <div className="selected-location-banner"><MapPin size={17} /><span><small>SELECTED MEET-UP AREA</small><strong>{selectedLocation.name}</strong>      <em>Central point verified by Geoapify in Athens, Greece</em></span><CheckCircle2 size={19} /></div>}
       <div className="location-bottom"><span><MapPin size={15} />{selectedLocation ? `Selected: ${selectedLocation.name}` : 'Choose a location to continue.'}</span><button className="button button-primary" onClick={onContinue} disabled={!selectedLocation}>Review your group <ArrowRight size={18} /></button></div>
-      <div className="geocoding-attribution">Geocoding by Nominatim · © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a></div>
+      <div className="geocoding-attribution">Location results provided by <a href="https://www.geoapify.com/" target="_blank" rel="noreferrer">Geoapify</a></div>
     </section>
   );
 }
@@ -724,7 +676,7 @@ function OverviewScreen({ group, location, notice, onEdit, onContinue }: { group
           <div className="member-card-bottom"><span>HAS A POINT</span><button className="member-edit-button" onClick={() => onEdit(member)}>Edit answers <ChevronRight size={14} /></button></div>
         </article>)}
       </div>
-      <div className="group-insight"><div className="insight-icon"><UsersRound size={21} /></div><div><strong>Different plans. One good choice.</strong><span>Recommendations use real place categories and coordinates. OpenStreetMap often lacks prices, hours, duration and vibe, so we never guess those details.</span></div><span className="insight-spark">✳</span></div>
+      <div className="group-insight"><div className="insight-icon"><UsersRound size={21} /></div><div><strong>Different plans. One good choice.</strong><span>Recommendations use real Geoapify places and coordinates. Budget, opening hours and exact activity duration are never guessed when a listing does not provide them.</span></div><span className="insight-spark">✳</span></div>
       <div className="overview-actions"><span>READY WHEN YOUR WHOLE CREW IS.</span><button className="button button-primary" onClick={onContinue}>Find our perfect plan <Sparkles size={17} /></button></div>
     </section>
   );
@@ -732,7 +684,7 @@ function OverviewScreen({ group, location, notice, onEdit, onContinue }: { group
 
 function RecommendationsScreen({ location, places, allPlaceCount, categoryFilter, loading, error, saved, activePlaceId, onCategoryFilterChange, onSelectPlace, onToggleSaved, onRetry }: {
   location: LocationSelection;
-  places: OpenStreetMapPlace[];
+  places: GeoapifyPlace[];
   allPlaceCount: number;
   categoryFilter: PlaceCategory | 'all';
   loading: boolean;
@@ -741,39 +693,39 @@ function RecommendationsScreen({ location, places, allPlaceCount, categoryFilter
   activePlaceId: string;
   onCategoryFilterChange: (category: PlaceCategory | 'all') => void;
   onSelectPlace: (placeId: string) => void;
-  onToggleSaved: (place: OpenStreetMapPlace) => void;
+  onToggleSaved: (place: GeoapifyPlace) => void;
   onRetry: () => void;
 }) {
   return (
     <section className="content-page recommendations-page">
-      <div className="recommendation-heading-row"><ScreenHeading eyebrow="DRUMROLL, PLEASE" accent="lime" title={<>Your kind of <span className="lime-text">place.</span></>} description={`Real OpenStreetMap listings near ${location.name}. Place details depend on what has been mapped.`} /><div className="match-stamp"><MapPin size={16} /><span>REAL<br />PLACES</span></div></div>
-      <div className="real-data-note"><span className="best-match-star">✳</span><div><strong>How these recommendations work</strong><span>We prioritize places matching the most participants’ selected interests and distances. Prices, hours, duration and mood are not consistently available in OpenStreetMap, so we never infer them.</span></div></div>
+      <div className="recommendation-heading-row"><ScreenHeading eyebrow="DRUMROLL, PLEASE" accent="lime" title={<>Your kind of <span className="lime-text">place.</span></>} description={`Real Geoapify places and activities near ${location.name}. Place details depend on what is available in the listing.`} /><div className="match-stamp"><MapPin size={16} /><span>REAL<br />PLACES</span></div></div>
+      <div className="real-data-note"><span className="best-match-star">✳</span><div><strong>How these recommendations work</strong><span>Interests rank first, then distance, then broad venue-category relevance to mood and time. Listings do not reliably provide budget, opening hours or exact duration, so those details are never assumed.</span></div></div>
       <div className="category-filters" aria-label="Filter places by category">
         <button className={categoryFilter === 'all' ? 'is-active' : ''} onClick={() => onCategoryFilterChange('all')} aria-pressed={categoryFilter === 'all'}>All places</button>
         {placeCategories.map(({ id, label }) => <button key={id} className={categoryFilter === id ? 'is-active' : ''} onClick={() => onCategoryFilterChange(id)} aria-pressed={categoryFilter === id}>{label}</button>)}
       </div>
-      {loading && <div className="places-feedback" role="status"><LoaderCircle className="location-spinner" size={20} />Searching OpenStreetMap for nearby places…</div>}
+      {loading && <div className="places-feedback" role="status"><LoaderCircle className="location-spinner" size={20} />Searching Geoapify for real places in Athens…</div>}
       {error && <div className="places-feedback places-error" role="alert"><span>{error}</span><button className="button button-secondary" onClick={onRetry}>Try again</button></div>}
-      {!loading && !error && allPlaceCount === 0 && <div className="places-feedback" role="status"><MapPin size={20} />No mapped places were found within 5 km of this location. Try another location or search again later.</div>}
+      {!loading && !error && allPlaceCount === 0 && <div className="places-feedback" role="status"><MapPin size={20} />No businesses or activities were found within 2 km of this location. Try another Athens area.</div>}
       {!loading && !error && allPlaceCount > 0 && places.length === 0 && <div className="places-feedback" role="status">No nearby places match this category filter. Choose another category to see more results.</div>}
       {allPlaceCount > 0 && <RealPlacesMap location={location} places={places} activePlaceId={activePlaceId} onSelectPlace={onSelectPlace} />}
       <div className="recommendation-list">{places.map((place, index) => <PlaceCard key={place.id} place={place} rank={index + 1} active={activePlaceId === place.id} saved={saved.includes(place.id)} onActivate={() => onSelectPlace(place.id)} onToggleSaved={onToggleSaved} />)}</div>
-      <div className="recommendation-footer"><span><span className="tiny-live-dot" /> REAL PLACE DATA · © OPENSTREETMAP CONTRIBUTORS</span><button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>Back to top <ArrowRight size={14} /></button></div>
+      <div className="recommendation-footer"><span><span className="tiny-live-dot" /> REAL PLACE DATA · GEOAPIFY</span><button onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>Back to top <ArrowRight size={14} /></button></div>
     </section>
   );
 }
 
 function RealPlacesMap({ location, places, activePlaceId, onSelectPlace }: {
-  location: LocationSelection; places: OpenStreetMapPlace[]; activePlaceId: string; onSelectPlace: (placeId: string) => void;
+  location: LocationSelection; places: GeoapifyPlace[]; activePlaceId: string; onSelectPlace: (placeId: string) => void;
 }) {
   const [tileError, setTileError] = useState(false);
   return (
-    <section className="real-map-section" aria-label={`Interactive map of real OpenStreetMap places near ${location.name}`}>
-      <div className="real-map-heading"><div><MapPin size={16} /><span>REAL OPENSTREETMAP PLACES</span></div><span>{location.name}</span></div>
+    <section className="real-map-section" aria-label={`Interactive map of real Geoapify places near ${location.name}`}>
+      <div className="real-map-heading"><div><MapPin size={16} /><span>REAL PLACES NEAR</span></div><span>{location.name}</span></div>
       <MapContainer key={`${location.lat},${location.lon}`} center={[location.lat, location.lon]} zoom={14} scrollWheelZoom={false} className="real-map">
         <TileLayer
-          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> · &copy; <a href="https://www.geoapify.com/">Geoapify</a>'
+          url={geoapifyMapTileUrl()}
           eventHandlers={{ tileerror: () => setTileError(true) }}
         />
         <MapFocus places={places} activePlaceId={activePlaceId} />
@@ -786,7 +738,7 @@ function RealPlacesMap({ location, places, activePlaceId, onSelectPlace }: {
           <Popup>
             <strong>{place.name}</strong><br />
             {placeCategoryLabel(place.category)} · {place.address}
-            <br /><a href={openStreetMapElementUrl(place)} target="_blank" rel="noreferrer">View OpenStreetMap listing</a>
+            <br /><a href={place.website || place.mapUrl} target="_blank" rel="noreferrer">{place.website ? 'Visit business website' : 'View on OpenStreetMap'}</a>
           </Popup>
         </Marker>)}
       </MapContainer>
@@ -795,7 +747,7 @@ function RealPlacesMap({ location, places, activePlaceId, onSelectPlace }: {
   );
 }
 
-function MapFocus({ places, activePlaceId }: { places: OpenStreetMapPlace[]; activePlaceId: string }) {
+function MapFocus({ places, activePlaceId }: { places: GeoapifyPlace[]; activePlaceId: string }) {
   const map = useMap();
   useEffect(() => {
     const activePlace = places.find((place) => place.id === activePlaceId);
@@ -815,40 +767,39 @@ function placeCategoryIcon(category: PlaceCategory) {
   return <Activity size={16} />;
 }
 
-function openStreetMapElementUrl(place: OpenStreetMapPlace) {
-  return `https://www.openstreetmap.org/${place.osmType}/${place.osmId}`;
-}
-
 function PlaceCard({ place, rank, active, saved, onActivate, onToggleSaved }: {
-  place: OpenStreetMapPlace; rank: number; active: boolean; saved: boolean; onActivate: () => void; onToggleSaved: (place: OpenStreetMapPlace) => void;
+  place: GeoapifyPlace; rank: number; active: boolean; saved: boolean; onActivate: () => void; onToggleSaved: (place: GeoapifyPlace) => void;
 }) {
   const interestReason = place.interestParticipantCount
-    ? `Interest match for ${place.interestMatchCount} of ${place.interestParticipantCount} participants who selected an activity.`
-    : 'No activity interests were selected.';
-  const budgetReason = place.budgetParticipantCount
-    ? `${place.knownBudgetMatchCount} of ${place.budgetParticipantCount} participants with comparable mapped cost data fit their budget; cost basis may vary.`
-    : 'No comparable cost data is available for this listing.';
-  const distanceReason = place.distanceParticipantCount
-    ? `Distance fits ${place.distanceMatchCount} of ${place.distanceParticipantCount} distance preferences.`
-    : 'No distance preference was selected.';
+    ? place.interestMatchCount
+      ? `Matches selected place interests for ${place.interestMatchCount} of ${place.interestParticipantCount} participants.`
+      : 'No selected place interests match this category.'
+    : 'No place interests were selected.';
+  const preferenceReason = place.preferenceParticipantCount
+    ? place.preferenceMatchCount
+      ? `Category fit for the mood or time preferences of ${place.preferenceMatchCount} of ${place.preferenceParticipantCount} participants.`
+      : 'No selected mood or time preferences match this category.'
+    : 'No mood or time preference was selected.';
   return (
     <article className={`activity-card real-place-card ${active ? 'venue-active' : ''}`}>
-      <div className={`activity-image-wrap place-art place-art-${place.category}`} aria-hidden="true">
-        <span className="place-art-icon">{placeCategoryIcon(place.category)}</span><span className="activity-rank">0{rank}</span>
+      <div
+        className={`activity-image-wrap place-art place-art-${place.category}`}
+        role="img"
+        aria-label={`${placeCategoryLabel(place.category)} placeholder; no verified photo for this business is available`}
+      >
+        <span className="place-art-icon" aria-hidden="true">{placeCategoryIcon(place.category)}</span>
+        <span className="place-photo-placeholder">No verified venue photo</span>
+        <span className="activity-rank">0{rank}</span>
       </div>
       <div className="activity-content">
-        <div className="activity-category">{placeCategoryIcon(place.category)}{placeCategoryLabel(place.category)} · OPENSTREETMAP</div>
+        <div className="activity-category">{placeCategoryIcon(place.category)}{placeCategoryLabel(place.category)} · GEOAPIFY</div>
         <div className="activity-title-row"><h2>{place.name}</h2><button className={`save-button ${saved ? 'is-saved' : ''}`} onClick={() => onToggleSaved(place)} aria-label={saved ? `Remove ${place.name} from shortlist` : `Add ${place.name} to shortlist`} aria-pressed={saved}>{saved ? <Check size={17} /> : <Plus size={18} />}</button></div>
-        <p className="activity-description">{place.description}</p>
         <div className="activity-meta">
           <span><MapPin size={15} />{place.address}<small> address</small></span>
-          <span><Wallet size={15} />{place.cost}<small> cost</small></span>
-          <span><Clock3 size={15} />{place.openingHours}<small> hours</small></span>
           <span>{Math.round(place.distanceKm * 100) / 100} km<small> straight-line distance</small></span>
         </div>
-        <div className="activity-reason"><span className="reason-spark">✳</span><p><strong>Group match</strong>{interestReason} {budgetReason} {distanceReason}</p></div>
-        <div className="place-extra-details"><span><strong>Cuisine:</strong> {place.cuisine}</span><span><strong>Phone:</strong> {place.phone}</span><span><strong>Website:</strong> {place.website}</span></div>
-        <div className="place-card-actions"><button className="activity-cta" onClick={onActivate}>Show on map <MapPin size={15} /></button><a className="osm-place-link" href={openStreetMapElementUrl(place)} target="_blank" rel="noreferrer">Open OpenStreetMap listing <ArrowRight size={14} /></a></div>
+        <div className="activity-reason"><span className="reason-spark">✳</span><p><strong>Group match</strong>{interestReason} Reliable price information and exact activity duration are unavailable; {preferenceReason}</p></div>
+        <div className="place-card-actions"><button className="activity-cta" onClick={onActivate}>Show on map <MapPin size={15} /></button><a className="osm-place-link" href={place.website || place.mapUrl} target="_blank" rel="noreferrer">{place.website ? 'Visit business website' : 'View on OpenStreetMap'} <ArrowRight size={14} /></a></div>
       </div>
     </article>
   );

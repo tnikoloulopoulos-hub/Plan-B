@@ -1,9 +1,9 @@
 # Plan-B
-Plan B helps groups of friends find real nearby places that fit their shared interests and location. Tagline: “Different plans. One good choice.”
+Plan B helps groups of friends find real places and activities in Athens that fit their shared interests, budget and mood. Tagline: “Different plans. One good choice.”
 
-## HW2 interactive mockup
+## Athens planning app
 
-This React + TypeScript prototype supports a group of 2–8 friends planning together on one shared device. Create a group, pass the device from person to person to add names and individual budget/time/mood/activity/distance preferences, choose a location, review or edit answers, and browse nearby places from OpenStreetMap. The session and selected coordinates are saved in this browser's local storage; invitation links, group codes, cross-device syncing, and real-time communication are not supported. There is no backend, account system, or live voting.
+This React + TypeScript application supports a group of 2–8 friends planning together on one shared device. Create a group, pass the device from person to person to add names and individual budget/time/mood/activity/distance preferences, select an Athens neighbourhood, review or edit answers, and browse nearby places from Geoapify. The session and selected coordinates are saved in this browser's local storage; invitation links, group codes, cross-device syncing, and real-time communication are not supported. There is no backend, account system, or live voting.
 
 ### Run locally
 
@@ -14,31 +14,34 @@ npm run dev
 
 Open the local URL printed by Vite. To create a production build, run `npm run build`.
 
+### Geoapify API configuration
+
+- Copy `.env.example` to `.env.local` and set `VITE_GEOAPIFY_API_KEY` to a Geoapify API key.
+- Restart Vite after changing environment variables.
+- Vite embeds `VITE_` variables in browser code and requests. The key is visible to users; configure Geoapify HTTP referrer/origin restrictions for the app's development and production domains, and enable only the required Geocoding and Places APIs. Never use a private server credential as a frontend key.
+
 ### Location and nearby places
 
-- **Current location:** the browser Geolocation API asks for permission, then Nominatim reverse-geocodes the actual coordinates.
-- **Manual location:** search a city or neighbourhood with Nominatim and select one of its returned, coordinate-bearing results. Arbitrary text is not treated as a real location.
-- **Nearby places:** on “Find our perfect plan,” the app requests up to 300 mapped place elements within 5 km of the selected coordinates from the Overpass API. Results include real OSM coordinates and only tagged details that are actually present; missing names, addresses, prices/fees, cuisine, opening hours, descriptions, phone numbers, and websites are shown as “Not available.”
-- **Map:** Leaflet displays OpenStreetMap tiles and markers for returned place records, with OSM attribution. OSM place links open the corresponding mapped element.
-- **Recommendations:** matching uses mapped place categories, straight-line distance from the chosen location, and comparable mapped cost data where present. Cost tags may not represent per-person prices. OSM does not consistently describe mood, duration, or opening hours, so the app does not infer a match for those preferences. Listings and map data can be incomplete or out of date.
-
-Nominatim searches and reverse lookups are user-triggered, serialized with at least 1.1 seconds between requests, and cached in the browser session. Nearby place queries are bounded to 5 km, capped at 300 results, issued only after user action, and cached for the current page session. If an Overpass instance is unavailable, rate-limited, or returns an invalid response, the app tries other public Overpass instances with a per-request timeout. If every instance fails, it reports the failure and never substitutes fictional listings. The app does not prefetch map tiles. Nominatim and Overpass are public community services and may be slow or rate-limited. Usage follows the [Nominatim public service policy](https://operations.osmfoundation.org/policies/nominatim/), [Overpass API guidance](https://dev.overpass-api.de/overpass-doc/en/preface/commons.html), and [OpenStreetMap tile policy](https://operations.osmfoundation.org/policies/tiles/).
+- **Geographic scope:** Athens, Greece and its nearby urban neighbourhoods only. Location must be searched and explicitly selected; browser GPS is not used.
+- **Geocoding:** Geoapify Geocoding searches are restricted to Greece and an Athens-area boundary. Results must include Greece/Attica and coordinates inside the configured Athens search extent.
+- **Nearby places:** after group review, Geoapify Places searches a 2 km radius around the selected Geoapify coordinates, requests up to 25 real place features, and uses the official catering, entertainment, activity, leisure and sport categories. Names, categories, coordinates and available addresses come from the API response; unnamed or irrelevant features are omitted.
+- **Map:** Leaflet displays OpenStreetMap tiles, actual returned markers, popups and OpenStreetMap attribution. A popup links to the business website when the API provides one, otherwise to its mapped coordinates.
+- **Recommendations:** actual interest-category matches rank first, proximity second, and broad category relevance to mood/time third. The Places API does not provide verified prices or exact activity durations for all listings, so budget fit, prices, hours and reviews are not invented or inferred.
+- **Failures:** missing/invalid keys, rate limits, network errors, invalid locations and a successful empty response are presented distinctly. Failed API calls never use sample businesses.
 
 ### Test the location and recommendation flow
 
-1. Run `npm install` and `npm run dev`, then open the local Vite URL.
+1. Configure `VITE_GEOAPIFY_API_KEY` as above, then run `npm run dev`.
 2. Create a group and enter each participant's preferences on the same device.
-3. Allow location access to test GPS, or search for a real city/neighbourhood and select a Nominatim result.
-4. Review the group, then choose **Find our perfect plan**. The app queries Overpass and shows mapped places, category filters, an interactive map, OSM links, and available listing details.
-5. Try a category filter, marker popup, and “Open OpenStreetMap listing.” If a public service is unavailable, confirm the app shows an error rather than sample businesses.
-6. To build for production, run `npm run build`; tests run with `npm test`.
-
-The app makes direct browser requests to the public Nominatim, Overpass, and OpenStreetMap tile services. No API key, paid service, backend, or external business-data provider is used. Display fonts and their license files remain bundled under `public/fonts`; recommendation cards do not use sample business photos.
+3. Search or choose a suggested Athens area (Pangrati, Syntagma, Kolonaki, Koukaki, Exarchia, Gazi, Monastiraki, Galatsi, Marousi or Nea Smyrni), then select a returned Geoapify location.
+4. Review the group and select **Find our perfect plan**. Confirm that real Geoapify results are shown on the Leaflet map with OpenStreetMap tiles and attribution.
+5. To build for production, run `npm run build`; automated tests run with `npm test`. Automated API tests use mock responses; live business-data verification requires a valid Geoapify API key.
 
 ### Project structure
 
 - `src/App.tsx` contains the screen flow and reusable UI components.
-- `src/openStreetMap.ts` handles Nominatim lookup, Overpass requests, OSM normalization, and local recommendation ranking.
+- `src/geoapify.ts` handles Athens geocoding, nearby places, validation, error handling and preference ranking.
+- `src/openStreetMap.ts` retains the previous Overpass implementation until the Geoapify rollout is verified with live API responses.
 - `src/data.ts` contains the preference and place-category choices.
 - `src/styles.css` contains the responsive visual system, location UI, results cards, and Leaflet map styles.
 - `public/images` and `public/fonts` contain the bundled visual assets.

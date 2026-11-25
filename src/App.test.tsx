@@ -1,9 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import App from './App';
-
-const originalGeolocationDescriptor = Object.getOwnPropertyDescriptor(navigator, 'geolocation');
 
 beforeEach(() => {
   vi.spyOn(window, 'scrollTo').mockImplementation(() => {});
@@ -15,13 +13,9 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   window.localStorage.clear();
   window.sessionStorage.clear();
-  if (originalGeolocationDescriptor) {
-    Object.defineProperty(navigator, 'geolocation', originalGeolocationDescriptor);
-  } else {
-    Reflect.deleteProperty(navigator, 'geolocation');
-  }
 });
 
 async function createGroup(user: ReturnType<typeof userEvent.setup>, participantCount = 2) {
@@ -60,46 +54,52 @@ describe('Plan B shared-device group journey', () => {
   it('creates a group and collects participant preferences one person at a time', async () => {
     const user = userEvent.setup();
     render(<App />);
+    expect(screen.getByRole('heading', { name: 'Plan B – Find your next plan in Athens.' })).toBeTruthy();
+    expect(screen.getByText("Discover places and activities in Athens that match your group's interests, budget and mood.")).toBeTruthy();
 
     await completeSharedDeviceGroup(user);
     expect(screen.getByRole('status').textContent).toContain('Everyone’s preferences are in');
     expect(screen.queryByRole('button', { name: /join a group|invite friends|share invitation/i })).toBeNull();
     expect(window.localStorage.getItem('planb-session-v2')).toContain('"participantCount":2');
 
-    let overpassRequestCount = 0;
-    let resolvePrimaryRequest: ((response: Response) => void) | undefined;
-    const primaryRequest = new Promise<Response>((resolve) => {
-      resolvePrimaryRequest = resolve;
-    });
-    const fetchMock = vi.fn((input: RequestInfo | URL, _init?: RequestInit) => {
-      const isSearch = String(input).includes('nominatim.openstreetmap.org');
-      if (isSearch) {
-        return Promise.resolve(new Response(JSON.stringify([{
-          display_name: 'My neighbourhood, Galway, Ireland',
-          lat: '53.27',
-          lon: '-9.05',
-          osm_type: 'relation',
-          osm_id: 1337,
-        }]), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubEnv('VITE_GEOAPIFY_API_KEY', 'test-geoapify-key');
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const requestUrl = new URL(String(input));
+      if (requestUrl.pathname === '/v1/geocode/search') {
+        return Promise.resolve(new Response(JSON.stringify({ results: [{
+          place_id: 'athens-neighbourhood-1',
+          formatted: 'Pangrati, Athens, Greece',
+          lat: 37.969,
+          lon: 23.747,
+          country_code: 'gr',
+          state: 'Attica',
+        }] }), { status: 200, headers: { 'content-type': 'application/json' } }));
       }
 
-      overpassRequestCount += 1;
-      if (overpassRequestCount === 1) {
-        return primaryRequest;
-      }
-      const payload = {
-        elements: [
-          { type: 'node', id: 101, lat: 53.271, lon: -9.05, tags: { name: 'Real Roast Cafe', amenity: 'cafe', cuisine: 'coffee_shop' } },
-          { type: 'way', id: 202, center: { lat: 53.272, lon: -9.051 }, tags: { name: 'Market Table', amenity: 'restaurant', 'addr:full': '5 Market Street' } },
-        ],
-      };
-      return Promise.resolve(new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } }));
+      return Promise.resolve(new Response(JSON.stringify({ features: [
+        { properties: {
+          place_id: 'test-cafe-1',
+          name: 'Test Geoapify Cafe',
+          lat: 37.970,
+          lon: 23.748,
+          categories: ['catering.cafe', 'catering.cafe.coffee_shop'],
+          formatted: 'Example Street 1, Athens, Greece',
+        } },
+        { properties: {
+          place_id: 'test-restaurant-2',
+          name: 'Test Geoapify Restaurant',
+          lat: 37.971,
+          lon: 23.749,
+          categories: ['catering.restaurant'],
+          formatted: 'Example Street 2, Athens, Greece',
+        } },
+      ] }), { status: 200, headers: { 'content-type': 'application/json' } }));
     });
     vi.stubGlobal('fetch', fetchMock);
-    await user.type(screen.getByRole('textbox', { name: /enter a city or neighbourhood/i }), '  My neighbourhood  ');
-    await user.click(screen.getByRole('button', { name: /search locations/i }));
-    await user.click(await screen.findByRole('button', { name: /My neighbourhood, Galway, Ireland/i }));
-    expect(screen.getByText('My neighbourhood, Galway, Ireland')).toBeTruthy();
+    await user.type(screen.getByRole('textbox', { name: /search an athens neighbourhood/i }), '  Pangrati  ');
+    await user.click(screen.getByRole('button', { name: /search Athens areas/i }));
+    await user.click(await screen.findByRole('button', { name: /Pangrati, Athens, Greece/i }));
+    expect(screen.getByText('Pangrati, Athens, Greece')).toBeTruthy();
     await user.click(screen.getByRole('button', { name: /review your group/i }));
     expect(screen.getByRole('heading', { name: /Friday crew lineup/i })).toBeTruthy();
     expect(screen.getByText('Alex')).toBeTruthy();
@@ -121,121 +121,103 @@ describe('Plan B shared-device group journey', () => {
     expect(screen.getByRole('status').textContent).toContain("Riley's answers have been updated");
     expect(within(screen.getAllByRole('article')[1]).getByText(/Coffee/)).toBeTruthy();
     await user.click(screen.getByRole('button', { name: /find our perfect plan/i }));
-    expect(await screen.findByText(/Searching OpenStreetMap for nearby places/i)).toBeTruthy();
-    resolvePrimaryRequest?.(new Response('<html><title>Not acceptable</title></html>', { status: 406 }));
 
-    expect(await screen.findByRole('heading', { name: 'Real Roast Cafe' })).toBeTruthy();
-    expect(screen.getByRole('heading', { name: 'Market Table' })).toBeTruthy();
-    expect(screen.getByText(/Interest match for 2 of 2 participants/)).toBeTruthy();
-    expect(screen.getAllByText('Not available').length).toBeGreaterThan(0);
-    expect(screen.getByRole('region', { name: /interactive map of real OpenStreetMap places/i })).toBeTruthy();
-    expect(screen.getAllByRole('link', { name: /Open OpenStreetMap listing/i })).toHaveLength(2);
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(String(fetchMock.mock.calls[1][0])).toContain('overpass-api.de/api/interpreter');
-    expect(String(fetchMock.mock.calls[2][0])).toContain('overpass.kumi.systems/api/interpreter');
-    expect(fetchMock.mock.calls[2][1]?.method).toBe('POST');
-    const overpassBody = new URLSearchParams(String(fetchMock.mock.calls[2][1]?.body));
-    const overpassQuery = overpassBody.get('data') ?? '';
-    expect(overpassQuery).toContain('around:5000,53.27,-9.05');
-    expect(overpassQuery).toContain('["amenity"');
+    expect(await screen.findByRole('heading', { name: 'Test Geoapify Cafe' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Test Geoapify Restaurant' })).toBeTruthy();
+    expect(screen.getByText(/Matches selected place interests for 2 of 2 participants/)).toBeTruthy();
+    expect(screen.getAllByText(/Reliable price information and exact activity duration are unavailable/).length).toBeGreaterThan(0);
+    const map = screen.getByRole('region', { name: /interactive map of real Geoapify places/i });
+    expect(map.querySelectorAll('.leaflet-marker-icon')).toHaveLength(2);
+    expect(map.textContent).toContain('OpenStreetMap contributors');
+    expect(map.textContent).toContain('Geoapify');
+    expect(screen.getAllByRole('link', { name: /View on OpenStreetMap/i })).toHaveLength(2);
+    expect(screen.getAllByRole('img', { name: /no verified photo for this business is available/i })).toHaveLength(2);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const geocodeUrl = new URL(String(fetchMock.mock.calls[0][0]));
+    expect(geocodeUrl.origin).toBe('https://api.geoapify.com');
+    expect(geocodeUrl.searchParams.get('text')).toBe('Pangrati, Athens, Greece');
+    expect(geocodeUrl.searchParams.get('filter')).toContain('rect:');
+    expect(geocodeUrl.searchParams.get('apiKey')).toBe('test-geoapify-key');
+    const placesUrl = new URL(String(fetchMock.mock.calls[1][0]));
+    expect(placesUrl.pathname).toBe('/v2/places');
+    expect(placesUrl.searchParams.get('filter')).toBe('circle:23.747,37.969,2000');
+    expect(placesUrl.searchParams.get('limit')).toBe('25');
+    expect(placesUrl.searchParams.get('categories')).toContain('catering.cafe');
+    expect(placesUrl.searchParams.get('categories')).toContain('entertainment');
     await user.click(screen.getByRole('button', { name: 'Restaurants' }));
-    expect(screen.queryByRole('heading', { name: 'Real Roast Cafe' })).toBeNull();
-    expect(screen.getByRole('heading', { name: 'Market Table' })).toBeTruthy();
-    const saveButton = screen.getByRole('button', { name: /add market table to shortlist/i });
+    expect(screen.queryByRole('heading', { name: 'Test Geoapify Cafe' })).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Test Geoapify Restaurant' })).toBeTruthy();
+    const saveButton = screen.getByRole('button', { name: /add test geoapify restaurant to shortlist/i });
     await user.click(saveButton);
-    expect(screen.getByRole('status').textContent).toContain('Market Table added to your shortlist');
+    expect(screen.getByRole('status').textContent).toContain('Test Geoapify Restaurant added to your shortlist');
+  }, 15000);
+
+  it('requires a manual Athens-area selection and does not offer browser GPS', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await completeSharedDeviceGroup(user);
+    expect(screen.getAllByText(/Athens, Greece/i).length).toBeGreaterThan(0);
+    expect(screen.getByRole('textbox', { name: /search an athens neighbourhood/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Pangrati' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Syntagma' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Galatsi' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /use my current location/i })).toBeNull();
+    expect((screen.getByRole('button', { name: /review your group/i }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('detects the current location and reverse-geocodes it with Nominatim', async () => {
+  it('selects one verified central result for a suggested neighbourhood', async () => {
     const user = userEvent.setup();
     render(<App />);
     await completeSharedDeviceGroup(user);
 
-    const position: GeolocationPosition = {
-      coords: {
-        latitude: 53.33,
-        longitude: -6.26,
-        accuracy: 10,
-        altitude: null,
-        altitudeAccuracy: null,
-        heading: null,
-        speed: null,
-        toJSON: () => ({}),
+    vi.stubEnv('VITE_GEOAPIFY_API_KEY', 'test-geoapify-key');
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ results: [
+      {
+        place_id: 'syntagma-central',
+        formatted: 'Syntagma, Vasilissis Amalias, Athens, Greece',
+        lat: 37.9755,
+        lon: 23.73567,
+        country_code: 'gr',
+        state: 'Attica',
       },
-      timestamp: Date.now(),
-      toJSON: () => ({}),
-    };
-    const getCurrentPosition = vi.fn((success: PositionCallback) => success(position));
-    Object.defineProperty(navigator, 'geolocation', { configurable: true, value: { getCurrentPosition } });
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      address: { neighbourhood: 'Ranelagh', city: 'Dublin' },
-    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      {
+        place_id: 'syntagma-street',
+        formatted: 'Syntagma, Vasilissis Sofias, Athens, Greece',
+        lat: 37.97563,
+        lon: 23.73967,
+        country_code: 'gr',
+        state: 'Attica',
+      },
+    ] }), { status: 200, headers: { 'content-type': 'application/json' } }));
     vi.stubGlobal('fetch', fetchMock);
 
-    await user.click(screen.getByRole('button', { name: /use my current location/i }));
-    await waitFor(() => expect(screen.getByText('Current area selected: Ranelagh, Dublin')).toBeTruthy());
-    expect(getCurrentPosition).toHaveBeenCalledOnce();
-    expect(fetchMock).toHaveBeenCalledOnce();
+    await user.click(screen.getByRole('button', { name: 'Syntagma' }));
+    expect(await screen.findByText('Syntagma, Athens, Greece')).toBeTruthy();
+    expect(document.querySelector('.location-result-list')).toBeNull();
+    expect(screen.getByText('Central point verified by Geoapify in Athens, Greece')).toBeTruthy();
     const requestUrl = new URL(String(fetchMock.mock.calls[0][0]));
-    expect(requestUrl.origin).toBe('https://nominatim.openstreetmap.org');
-    expect(requestUrl.searchParams.get('lat')).toBe('53.33');
-    expect(requestUrl.searchParams.get('lon')).toBe('-6.26');
-    expect(screen.getByRole('link', { name: /OpenStreetMap contributors/i })).toBeTruthy();
-    expect(JSON.parse(window.localStorage.getItem('planb-session-v2') ?? '{}').selectedLocation).toEqual({
-      name: 'Ranelagh, Dublin',
-      lat: 53.33,
-      lon: -6.26,
-      source: 'current',
-    });
+    expect(requestUrl.searchParams.get('limit')).toBe('1');
+    expect(requestUrl.searchParams.get('text')).toBe('Syntagma, Athens, Greece');
+  }, 15000);
 
-    await user.click(screen.getByRole('button', { name: /review your group/i }));
-    cleanup();
-
-    render(<App />);
-    expect(screen.getByRole('heading', { name: /Friday crew lineup/i })).toBeTruthy();
-    expect(screen.getByText(/Meet-up area: Ranelagh, Dublin/i)).toBeTruthy();
-  });
-
-  it('shows a permission denial and keeps manual location entry available', async () => {
+  it('rejects Geoapify search results outside Athens, Greece', async () => {
     const user = userEvent.setup();
     render(<App />);
     await completeSharedDeviceGroup(user);
-
-    const permissionError: GeolocationPositionError = {
-      code: 1,
-      message: 'User denied Geolocation',
-      PERMISSION_DENIED: 1,
-      POSITION_UNAVAILABLE: 2,
-      TIMEOUT: 3,
-    };
-    const getCurrentPosition = vi.fn((_success: PositionCallback, error: PositionErrorCallback) => error(permissionError));
-    Object.defineProperty(navigator, 'geolocation', { configurable: true, value: { getCurrentPosition } });
-    await user.click(screen.getByRole('button', { name: /use my current location/i }));
-    const permissionAlert = await screen.findByRole('alert');
-    expect(permissionAlert.textContent).toMatch(/permission was denied/i);
-
-    const fetchMock = vi.fn((input: RequestInfo | URL) => {
-      const isSearch = String(input).includes('nominatim.openstreetmap.org');
-      const payload = isSearch ? [{
-        display_name: 'Galway, Ireland',
-        lat: '53.28',
-        lon: '-9.08',
-        osm_type: 'relation',
-        osm_id: 1234,
-      }] : { error: 'Service unavailable' };
-      return Promise.resolve(new Response(JSON.stringify(payload), {
-        status: isSearch ? 200 : 503,
-        headers: { 'content-type': 'application/json' },
-      }));
-    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ results: [{
+      place_id: 'outside-athens',
+      formatted: 'Thessaloniki, Greece',
+      lat: 40.6401,
+      lon: 22.9444,
+      country_code: 'gr',
+      state: 'Central Macedonia',
+    }] }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubEnv('VITE_GEOAPIFY_API_KEY', 'test-geoapify-key');
     vi.stubGlobal('fetch', fetchMock);
-    await user.type(screen.getByRole('textbox', { name: /enter a city or neighbourhood/i }), 'Galway');
-    await user.click(screen.getByRole('button', { name: /search locations/i }));
-    await user.click(await screen.findByRole('button', { name: /Galway, Ireland/i }));
-    expect(screen.getByText('Galway, Ireland')).toBeTruthy();
-    await user.click(screen.getByRole('button', { name: /review your group/i }));
-    await user.click(screen.getByRole('button', { name: /find our perfect plan/i }));
-    expect(await screen.findByText(/places service is temporarily unavailable/i)).toBeTruthy();
-    expect(screen.queryByRole('heading', { name: /Slow Morning Coffee|Olive & Ember|The Lilac Hour/i })).toBeNull();
+    await user.type(screen.getByRole('textbox', { name: /search an athens neighbourhood/i }), 'Thessaloniki');
+    await user.click(screen.getByRole('button', { name: /search Athens areas/i }));
+    expect(await screen.findByText(/No matching area found in Athens, Greece/i)).toBeTruthy();
+    expect((screen.getByRole('button', { name: /review your group/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });

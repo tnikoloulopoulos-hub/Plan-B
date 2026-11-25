@@ -460,6 +460,7 @@ button:disabled { cursor: not-allowed; }
 }
 
 .location-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 30px; }
+.athens-location-options { grid-template-columns: minmax(0, 760px); }
 .location-option { min-width: 0; position: relative; padding: 21px; border: 1px solid #e8e1d7; border-radius: 7px; background: var(--paper); transition: border-color .2s, box-shadow .2s; }
 .location-option.is-active { border-color: var(--purple); box-shadow: 0 0 0 2px rgba(103, 64, 235, .09); }
 .location-option.is-selected { border-color: #9abf37; box-shadow: 0 0 0 2px rgba(154, 191, 55, .15); }
@@ -508,6 +509,10 @@ button:disabled { cursor: not-allowed; }
 .location-result:hover { border-color: var(--purple); background: #f7f3ff; }
 .location-result > span { min-width: 0; flex: 1; }
 .location-result > svg { flex: 0 0 auto; color: var(--purple); }
+.athens-suggestions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 13px; }
+.athens-suggestions button { min-height: 31px; padding: 0 10px; border: 1px solid #e8e1d7; border-radius: 16px; color: #625a59; background: #fffefa; cursor: pointer; font-size: 9px; font-weight: 600; }
+.athens-suggestions button:hover:not(:disabled) { border-color: var(--purple); color: var(--purple-dark); background: #f1edff; }
+.athens-suggestions button:disabled { cursor: progress; opacity: .6; }
 .manual-location-button { justify-content: center; }
 .manual-location-button:disabled { opacity: .6; }
 .location-feedback.gps-error { border-color: #f1c8cc; color: #843e47; background: #fff3f3; }
@@ -536,6 +541,7 @@ button:disabled { cursor: not-allowed; }
 .place-art-activity { background: #e7efcf; }
 .place-art-icon { width: 72px; height: 72px; display: grid; place-items: center; border: 1px solid rgba(36, 32, 37, .08); border-radius: 50%; color: var(--purple); background: rgba(255, 252, 246, .78); }
 .place-art-icon svg { width: 29px; height: 29px; }
+.place-photo-placeholder { position: absolute; bottom: 42px; left: 8px; right: 8px; color: #625a59; font-size: 8px; font-weight: 700; text-align: center; text-shadow: 0 1px 2px rgba(255, 255, 255, .8); }
 .real-place-card .activity-rank { z-index: 1; }
 .real-place-card .activity-title-row h2 { overflow-wrap: anywhere; }
 .real-place-card .activity-meta { gap: 8px 14px; }

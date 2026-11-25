@@ -70,17 +70,22 @@ type MemberPreferences = {
 
 const nominatimCacheStorageKey = 'planb-nominatim-cache-v2';
 const nominatimThrottleStorageKey = 'planb-nominatim-next-request-v2';
+const nearbyPlacesCacheStorageKey = 'planb-nearby-places-cache-v1';
 const nearbyPlacesCache = new Map<string, OpenStreetMapPlace[]>();
+const nearbyPlacesInFlight = new Map<string, Promise<OpenStreetMapPlace[]>>();
 const nominatimCache = new Map<string, unknown>();
 let nextNominatimRequestAt = 0;
 let nominatimRequestQueue: Promise<void> = Promise.resolve();
-const nearbyRadiusMeters = 5000;
+const nearbyRadiusMeters = 1500;
 const overpassEndpoints = [
+  'https://overpass.openstreetmap.fr/api/interpreter',
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://overpass.private.coffee/api/interpreter',
 ];
-const overpassRequestTimeoutMs = 18000;
+const overpassRequestTimeoutMs = 10000;
+const overpassRetryDelayMs = 300;
+const maxCachedNearbyLocations = 10;
 
 class OverpassQueryError extends Error {
   constructor(status: number) {
@@ -91,6 +96,72 @@ class OverpassQueryError extends Error {
 
 function coordinateKey(lat: number, lon: number) {
   return `${lat.toFixed(4)},${lon.toFixed(4)}`;
+}
+
+function getCachedNearbyPlaces(key: string): OpenStreetMapPlace[] | undefined {
+  if (nearbyPlacesCache.has(key)) return nearbyPlacesCache.get(key);
+  try {
+    const stored = window.sessionStorage.getItem(nearbyPlacesCacheStorageKey);
+    if (!stored) return undefined;
+    const parsed: unknown = JSON.parse(stored);
+    if (typeof parsed !== 'object' || parsed === null || !(key in parsed)) return undefined;
+    const places: unknown = (parsed as Record<string, unknown>)[key];
+    if (!Array.isArray(places) || !places.every(isCachedNearbyPlace)) return undefined;
+    nearbyPlacesCache.set(key, places);
+    return places;
+  } catch (error) {
+    console.error('Could not read the nearby places cache.', error);
+    return undefined;
+  }
+}
+
+function isCachedNearbyPlace(value: unknown): value is OpenStreetMapPlace {
+  if (typeof value !== 'object' || value === null) return false;
+  const place = value as Record<string, unknown>;
+  return typeof place.id === 'string' &&
+    (place.osmType === 'node' || place.osmType === 'way' || place.osmType === 'relation') &&
+    typeof place.osmId === 'number' &&
+    typeof place.name === 'string' &&
+    (place.category === 'cafe' || place.category === 'restaurant' || place.category === 'bar' || place.category === 'activity') &&
+    typeof place.lat === 'number' &&
+    typeof place.lon === 'number' &&
+    typeof place.address === 'string' &&
+    typeof place.cuisine === 'string' &&
+    typeof place.openingHours === 'string' &&
+    typeof place.cost === 'string' &&
+    typeof place.description === 'string' &&
+    typeof place.phone === 'string' &&
+    typeof place.website === 'string' &&
+    typeof place.distanceKm === 'number' &&
+    typeof place.interestMatchCount === 'number' &&
+    typeof place.interestParticipantCount === 'number' &&
+    typeof place.distanceMatchCount === 'number' &&
+    typeof place.distanceParticipantCount === 'number' &&
+    typeof place.knownBudgetMatchCount === 'number' &&
+    typeof place.budgetParticipantCount === 'number';
+}
+
+function cacheNearbyPlaces(key: string, places: OpenStreetMapPlace[]) {
+  nearbyPlacesCache.set(key, places);
+  try {
+    const stored = window.sessionStorage.getItem(nearbyPlacesCacheStorageKey);
+    const parsed: unknown = stored ? JSON.parse(stored) : {};
+    const previous = typeof parsed === 'object' && parsed !== null
+      ? parsed as Record<string, unknown>
+      : {};
+    previous[key] = places;
+    const keys = Object.keys(previous);
+    for (const oldKey of keys.slice(0, Math.max(0, keys.length - maxCachedNearbyLocations))) {
+      delete previous[oldKey];
+    }
+    window.sessionStorage.setItem(nearbyPlacesCacheStorageKey, JSON.stringify(previous));
+  } catch (error) {
+    console.error('Could not write the nearby places cache.', error);
+  }
+}
+
+function waitBeforeOverpassRetry(): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, overpassRetryDelayMs));
 }
 
 function getCachedNominatimValue<T>(key: string): T | undefined {
@@ -420,82 +491,109 @@ export async function fetchNearbyPlaces(lat: number, lon: number): Promise<OpenS
   if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lon) || lon < -180 || lon > 180) {
     throw new Error('Choose a valid map location before searching for nearby places.');
   }
-  const cacheKey = coordinateKey(lat, lon);
-  const cached = nearbyPlacesCache.get(cacheKey);
-  if (cached) return cached;
+  const cacheKey = `${nearbyRadiusMeters}:${coordinateKey(lat, lon)}`;
+  const cached = getCachedNearbyPlaces(cacheKey);
+  if (cached !== undefined) return cached;
+  const inFlight = nearbyPlacesInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
 
   const query = [
-    '[out:json][timeout:15];',
+    '[out:json][timeout:8];',
     '(',
     `nwr["amenity"~"^(cafe|restaurant|fast_food|food_court|ice_cream|bar|pub|biergarten|cinema|theatre|nightclub|arts_centre|community_centre|events_venue|marketplace)$"](around:${nearbyRadiusMeters},${lat},${lon});`,
     `nwr["leisure"~"^(park|garden|sports_centre|swimming_pool|fitness_centre|bowling_alley|escape_game)$"](around:${nearbyRadiusMeters},${lat},${lon});`,
     `nwr["tourism"~"^(museum|gallery|attraction|zoo|aquarium)$"](around:${nearbyRadiusMeters},${lat},${lon});`,
-    ');out center tags 300;',
+    ');out center tags 150;',
   ].join('');
 
-  const failures: { kind: 'timeout' | 'network' | 'rate-limit' | 'http' | 'response'; status?: number }[] = [];
-  for (const endpoint of overpassEndpoints) {
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), overpassRequestTimeoutMs);
-    try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-        },
-        body: new URLSearchParams({ data: query }),
-        signal: controller.signal,
-      });
+  const request = (async () => {
+    const failures: { kind: 'timeout' | 'network' | 'rate-limit' | 'http' | 'response'; status?: number }[] = [];
+    for (const endpoint of overpassEndpoints) {
+      let retried = false;
+      while (true) {
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), overpassRequestTimeoutMs);
+        try {
+          const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              Accept: 'application/json',
+              'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            },
+            body: new URLSearchParams({ data: query }),
+            signal: controller.signal,
+          });
 
-      if (!response.ok) {
-        const kind = response.status === 429 ? 'rate-limit' : 'http';
-        failures.push({ kind, status: response.status });
-        console.warn(`Overpass endpoint ${endpoint} returned HTTP ${response.status}.`);
-        if (response.status === 400 || response.status === 422) {
-          throw new OverpassQueryError(response.status);
+          if (!response.ok) {
+            const retryable = response.status === 429 || response.status >= 500;
+            const kind = response.status === 429 ? 'rate-limit' : 'http';
+            failures.push({ kind, status: response.status });
+            console.warn(`Overpass endpoint ${endpoint} returned HTTP ${response.status}.`);
+            if (response.status === 400 || response.status === 422) {
+              throw new OverpassQueryError(response.status);
+            }
+            if (retryable && !retried) {
+              retried = true;
+              await waitBeforeOverpassRetry();
+              continue;
+            }
+            break;
+          }
+          try {
+            const places = parseOverpassPlaces(await response.json());
+            cacheNearbyPlaces(cacheKey, places);
+            return places;
+          } catch {
+            failures.push({ kind: 'response' });
+            console.warn(`Overpass endpoint ${endpoint} returned an invalid or incomplete response.`);
+            break;
+          }
+        } catch (error) {
+          if (error instanceof OverpassQueryError) throw error;
+          const timedOut = error instanceof Error && /AbortError|TimeoutError/.test(error.name);
+          failures.push({ kind: timedOut ? 'timeout' : 'network' });
+          console.warn(`Overpass endpoint ${endpoint} could not complete the request.`, error);
+          if (!timedOut && !retried) {
+            retried = true;
+            await waitBeforeOverpassRetry();
+            continue;
+          }
+          break;
         }
-        continue;
+        finally {
+          window.clearTimeout(timeoutId);
+        }
       }
-      try {
-        const places = parseOverpassPlaces(await response.json());
-        nearbyPlacesCache.set(cacheKey, places);
-        return places;
-      } catch {
-        failures.push({ kind: 'response' });
-        console.warn(`Overpass endpoint ${endpoint} returned an invalid or incomplete response.`);
-      }
-    } catch (error) {
-      if (error instanceof OverpassQueryError) throw error;
-      const timedOut = error instanceof Error && /AbortError|TimeoutError/.test(error.name);
-      failures.push({ kind: timedOut ? 'timeout' : 'network' });
-      console.warn(`Overpass endpoint ${endpoint} could not complete the request.`, error);
-    } finally {
-      window.clearTimeout(timeoutId);
     }
-  }
 
-  if (failures.length > 0 && failures.every((failure) => failure.kind === 'rate-limit')) {
-    throw new Error('The OpenStreetMap places services are busy. Please wait a moment and try again.');
-  }
-  if (failures.length > 0 && failures.every((failure) => failure.kind === 'timeout')) {
-    throw new Error('The nearby places search timed out on available OpenStreetMap services. Try again shortly.');
-  }
-  if (failures.length > 0 && failures.every((failure) => failure.kind === 'network')) {
-    throw new Error('Nearby places services could not be reached. Check your connection or try again.');
-  }
-  const statuses = [...new Set(failures.flatMap((failure) => failure.status === undefined ? [] : [failure.status]))];
-  if (statuses.length) {
-    throw new Error(`The places service is temporarily unavailable after trying all Overpass endpoints (HTTP ${statuses.join(', ')}). Try again shortly.`);
-  }
-  if (failures.some((failure) => failure.kind === 'timeout')) {
-    throw new Error('Nearby places services were slow or unavailable. Try again shortly.');
-  }
-  if (failures.some((failure) => failure.kind === 'response')) {
+    if (failures.length > 0 && failures.every((failure) => failure.kind === 'rate-limit')) {
+      throw new Error('The OpenStreetMap places services are busy. Please wait a moment and try again.');
+    }
+    if (failures.length > 0 && failures.every((failure) => failure.kind === 'timeout')) {
+      throw new Error('The nearby places search timed out on available OpenStreetMap services. Try again shortly.');
+    }
+    if (failures.length > 0 && failures.every((failure) => failure.kind === 'network')) {
+      throw new Error('Nearby places services could not be reached. Check your connection or try again.');
+    }
+    const statuses = [...new Set(failures.flatMap((failure) => failure.status === undefined ? [] : [failure.status]))];
+    if (statuses.length) {
+      throw new Error(`The places service is temporarily unavailable after trying all Overpass endpoints (HTTP ${statuses.join(', ')}). Try again shortly.`);
+    }
+    if (failures.some((failure) => failure.kind === 'timeout')) {
+      throw new Error('Nearby places services were slow or unavailable. Try again shortly.');
+    }
+    if (failures.some((failure) => failure.kind === 'response')) {
+      throw new Error('The places service returned incomplete data from all Overpass endpoints. Try searching again shortly.');
+    }
+    if (failures.some((failure) => failure.kind === 'rate-limit')) {
+      throw new Error('The OpenStreetMap places services are busy or unavailable. Please wait a moment and try again.');
+    }
     throw new Error('The places service returned incomplete data from all Overpass endpoints. Try searching again shortly.');
+  })();
+  nearbyPlacesInFlight.set(cacheKey, request);
+  try {
+    return await request;
+  } finally {
+    if (nearbyPlacesInFlight.get(cacheKey) === request) nearbyPlacesInFlight.delete(cacheKey);
   }
-  if (failures.some((failure) => failure.kind === 'rate-limit')) {
-    throw new Error('The OpenStreetMap places services are busy or unavailable. Please wait a moment and try again.');
-  }
-  throw new Error('The places service returned incomplete data from all Overpass endpoints. Try searching again shortly.');
 }
